@@ -604,6 +604,7 @@ static int airoha_xpon_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct airoha_xpon *xpon;
+	struct resource *gpon_res;
 	int ret;
 
 	xpon = devm_kzalloc(dev, sizeof(*xpon), GFP_KERNEL);
@@ -650,6 +651,16 @@ static int airoha_xpon_probe(struct platform_device *pdev)
 	if (IS_ERR(xpon->epon_base))
 		return dev_err_probe(dev, PTR_ERR(xpon->epon_base),
 		                     "failed to map EPON MAC registers\n");
+
+	/* Absent on MACs without a dedicated GPON block; only diagnostics use it. */
+	gpon_res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "gpon");
+	if (gpon_res) {
+		xpon->gpon_window_len = resource_size(gpon_res);
+		xpon->gpon_base = devm_ioremap_resource(dev, gpon_res);
+		if (IS_ERR(xpon->gpon_base))
+			return dev_err_probe(dev, PTR_ERR(xpon->gpon_base),
+			                     "failed to map GPON MAC registers\n");
+	}
 
 	xpon->pon_phy_base =
 		devm_platform_ioremap_resource_byname(pdev, "pon-phy");

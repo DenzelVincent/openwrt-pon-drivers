@@ -6,6 +6,7 @@
 #include <linux/types.h>
 
 struct airoha_xpon;
+struct seq_file;
 
 /*
  * ITU-T G.984 GPON PLOAM message types (downstream).
@@ -50,6 +51,8 @@ void airoha_xpon_gpon_restart_mac(struct airoha_xpon *xpon,
                                   const char *reason);
 void airoha_xpon_gpon_advance(struct airoha_xpon *xpon, u32 phy_events,
                               unsigned long *delay);
+void airoha_xpon_gpon_debug_window(struct airoha_xpon *xpon,
+                                   struct seq_file *m);
 void airoha_xpon_gpon_counters_start(struct airoha_xpon *xpon);
 void airoha_xpon_gpon_counters_update(struct airoha_xpon *xpon);
 

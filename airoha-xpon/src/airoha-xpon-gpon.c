@@ -3,11 +3,15 @@
 /*
  * Airoha AN7581 GPON (ITU-T G.984) MAC implementation.
  *
- * The PON MAC block on AN7581 shares the same register window between
- * gigabit GPON (2.488/1.244 Gbps) and XG-PON/XGS-PON; this file drives
- * the gigabit GPON variant by switching the PCS profile and the digital
- * PHY RX mode, while reusing the common MAC reset / MBI-MPI stop /
- * T-CONT/GEM programming logic from airoha-xpon-ploam.c and airoha-xpon-control.c.
+ * The PON MAC block on AN7581 exposes separate "gpon" and "xgpon" register
+ * windows; this file currently drives gigabit GPON (2.488/1.244 Gbps) through
+ * the XG-PON window while switching the PCS profile and the digital PHY RX
+ * mode, and reuses the common MAC reset / MBI-MPI stop / T-CONT/GEM
+ * programming logic from airoha-xpon-ploam.c and airoha-xpon-control.c.
+ *
+ * Whether GPON status lives in the dedicated "gpon" window is not established
+ * by any local source; airoha_xpon_gpon_debug_window() dumps both so a field
+ * capture can decide.
  *
  * Implementation is an independent, from-scratch driver based on ITU-T
  * G.984.3 (GTC layer) and G.984.4 (OMCI) provisions. Register semantics
@@ -20,6 +24,7 @@
 #include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/iopoll.h>
+#include <linux/seq_file.h>
 #include <linux/workqueue.h>
 
 #include "airoha-xpon-private.h"
@@ -27,9 +32,10 @@
 #include "airoha-xpon-gpon.h"
 
 /*
- * GPON uses the same MAC block. Reuse the XG-PON register offsets since the
- * hardware window is identical; semantic differences (PLOAM message width,
- * activation flow) are handled in the driver.
+ * The MAC control path reuses the XG-PON register offsets. That mapping is an
+ * assumption, not vendor-documented fact; airoha_xpon_gpon_debug_window()
+ * prints the dedicated GPON window alongside so real hardware can confirm
+ * which block reports GTC sync and PLOAM activity.
  */
 
 /*
@@ -478,6 +484,15 @@ int airoha_xpon_gpon_prepare(struct airoha_xpon *xpon)
 	                         AIROHA_XGPON_MBI_MPI_STOP_MASK);
 	airoha_xgpon_update_bits(xpon, AIROHA_XGPON_SW_RST,
 	                         AIROHA_XGPON_MAC_RESET_RELEASED, 0);
+	/*
+	 * MAC reset leaves ONU_ID behind, so an assignment from an earlier XG-PON
+	 * session would still read back as valid and hide the real O2/O4 state.
+	 */
+	airoha_xgpon_update_bits(xpon, AIROHA_XGPON_ONU_ID,
+	                         AIROHA_XGPON_ONU_ID_VALID |
+	                                 AIROHA_XGPON_ONU_ID_MASK,
+	                         AIROHA_XGPON_BROADCAST_ID);
+	xpon->onu_id = AIROHA_XGPON_BROADCAST_ID;
 	airoha_pon_phy_write(xpon, AIROHA_XGPON_PHY_SFP_VLD_LEVEL,
 	                     xpon->frontend_link.xgpon_sfp_valid_level);
 	airoha_pon_phy_write(xpon, AIROHA_XGPON_PHY_INT_ENABLE, 0);
@@ -796,4 +811,54 @@ void airoha_xpon_gpon_advance(struct airoha_xpon *xpon, u32 phy_events,
 bool airoha_xpon_mode_is_gpon(enum airoha_xpon_mode mode)
 {
 	return mode == AIROHA_XPON_MODE_GPON;
+}
+
+/*
+ * GPON MAC register forensics. The device tree exposes a dedicated "gpon"
+ * window that no driver in this tree consumes, and the local sources do not
+ * document whether GPON GTC status appears there or in the shared XG-PON
+ * window. Dump both raw views so a field capture shows which block actually
+ * tracks the incoming frames.
+ */
+void airoha_xpon_gpon_debug_window(struct airoha_xpon *xpon,
+                                   struct seq_file *m)
+{
+	unsigned int i, words;
+
+	seq_printf(m,
+		   "phy_raw: sync_ctrl=0x%08x dbg_rx_sync_st=0x%08x physet10=0x%08x int_status=0x%08x int_enable=0x%08x phy_sta=0x%08x\n",
+		   airoha_pon_phy_read(xpon, AIROHA_XGPON_PHY_RX_SYNC_CTRL),
+		   airoha_pon_phy_read(xpon, AIROHA_XGPON_PHY_DBG_RX_SYNC_ST),
+		   airoha_pon_phy_read(xpon, AIROHA_GEPON_PHYSET10),
+		   airoha_pon_phy_read(xpon, AIROHA_XGPON_PHY_INT_STATUS),
+		   airoha_pon_phy_read(xpon, AIROHA_XGPON_PHY_INT_ENABLE),
+		   airoha_pon_phy_read(xpon, AIROHA_XGPON_PHY_XG_PHY_STA));
+
+	seq_printf(m, "gpon_window: %s len: 0x%zx\n",
+		   xpon->gpon_base ? "mapped" : "absent",
+		   xpon->gpon_window_len);
+	if (!xpon->gpon_base)
+		return;
+	/*
+	 * Only walk the window once the MAC has answered reset polling, otherwise a
+	 * block without a clock would hang the read.
+	 */
+	if (!xpon->mac_initialized) {
+		seq_puts(m, "gpon_window: skipped, mac not initialized\n");
+		return;
+	}
+
+	words = (xpon->gpon_window_len / 4) & ~7U;
+	for (i = 0; i < words; i += 8)
+		seq_printf(m,
+			   "gpon 0x%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			   i * 4,
+			   readl(xpon->gpon_base + (i + 0) * 4),
+			   readl(xpon->gpon_base + (i + 1) * 4),
+			   readl(xpon->gpon_base + (i + 2) * 4),
+			   readl(xpon->gpon_base + (i + 3) * 4),
+			   readl(xpon->gpon_base + (i + 4) * 4),
+			   readl(xpon->gpon_base + (i + 5) * 4),
+			   readl(xpon->gpon_base + (i + 6) * 4),
+			   readl(xpon->gpon_base + (i + 7) * 4));
 }

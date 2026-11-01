@@ -226,6 +226,8 @@ struct airoha_xpon {
 	struct device *dev;
 	struct dentry *debug_dir;
 	void __iomem *xgpon_base;
+	void __iomem *gpon_base;
+	size_t gpon_window_len;
 	void __iomem *epon_base;
 	void __iomem *pon_phy_base;
 	struct regmap *scu;

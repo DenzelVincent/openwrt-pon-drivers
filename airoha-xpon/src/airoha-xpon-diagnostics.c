@@ -13,6 +13,7 @@
 
 #include "airoha-xpon-private.h"
 #include "airoha-xpon-epon.h"
+#include "airoha-xpon-gpon.h"
 
 static const char *airoha_xpon_lifecycle_name(enum airoha_xpon_lifecycle state)
 {
@@ -433,6 +434,11 @@ static int pon_pcs_debug_show(struct seq_file *m, void *unused)
 	           "frequency_target: 0x%04x\n"
 	           "rx_ready_gate: %d\n"
 	           "rx_fifo_reset_released: %d\n"
+	           "cdr_pr_idac: 0x%04x\n"
+	           "xpon_setting0: 0x%08x\n"
+	           "xpon_setting1: 0x%08x\n"
+	           "wan_sel: %u\n"
+	           "xsi_sel: %u\n"
 	           "calibration_stage: %u\n"
 	           "calibration_error: %d\n"
 	           "calibration_runs: %u\n"
@@ -442,7 +448,9 @@ static int pon_pcs_debug_show(struct seq_file *m, void *unused)
 	           status.signal_detected, status.rx_mode_raw,
 	           status.freqdet_locked, status.frequency_level,
 	           status.frequency_target, status.rx_ready_gate,
-	           status.rx_fifo_reset_released, status.calibration_stage,
+	           status.rx_fifo_reset_released, status.cdr_pr_idac,
+	           status.xpon_setting0, status.xpon_setting1,
+	           status.wan_sel, status.xsi_sel, status.calibration_stage,
 	           status.calibration_error, status.calibration_runs,
 	           status.eo_gain, status.eo_peaking, status.eo_fom);
 	if (epon) {
@@ -468,6 +476,13 @@ static int pon_pcs_debug_show(struct seq_file *m, void *unused)
 		           airoha_xgpon_sync_name(sync),
 		           airoha_pon_phy_read(
 				   xpon, AIROHA_XGPON_PHY_XG_CONTINUE_CTRL));
+		/*
+		 * The dedicated "gpon" window has no vendor register map, so
+		 * reusing the XG-PON offsets is an assumption; dump both for
+		 * field evidence.
+		 */
+		if (airoha_xpon_mode_is_gpon(xpon->active_mode))
+			airoha_xpon_gpon_debug_window(xpon, m);
 	}
 out:
 	mutex_unlock(&xpon->state_lock);

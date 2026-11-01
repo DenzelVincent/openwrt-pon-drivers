@@ -17,6 +17,7 @@ static const struct airoha_xpon_mode_info airoha_xpon_modes[] = {
 		.name = "gpon",
 		.frontend_mode = AIROHA_PON_FRONTEND_MODE_GPON,
 		.control_protocol = AIROHA_XPON_CONTROL_OMCI,
+		.mac_supported = true,
 	},
 	{
 		.mode = AIROHA_XPON_MODE_XGPON,

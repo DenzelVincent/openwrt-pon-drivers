@@ -22,6 +22,7 @@
 
 #include "airoha-xpon-private.h"
 #include "airoha-xpon-epon.h"
+#include "airoha-xpon-gpon.h"
 #include "airoha-xpon-oam.h"
 #include "airoha-xpon-omci.h"
 #include "airoha-xpon-xgpon.h"
@@ -75,6 +76,8 @@ static irqreturn_t airoha_xpon_phy_irq_thread(int irq, void *data)
 		return IRQ_NONE;
 	if (airoha_xpon_mode_is_epon(mode))
 		return airoha_xpon_epon_phy_irq(xpon);
+	if (airoha_xpon_mode_is_gpon(mode))
+		return airoha_xpon_gpon_phy_irq(xpon);
 
 	return airoha_xpon_xgpon_phy_irq(xpon);
 }
@@ -90,6 +93,8 @@ static irqreturn_t airoha_xpon_irq_thread(int irq, void *data)
 		return IRQ_NONE;
 	if (airoha_xpon_mode_is_epon(READ_ONCE(xpon->active_mode)))
 		return airoha_xpon_epon_irq(xpon);
+	if (airoha_xpon_mode_is_gpon(READ_ONCE(xpon->active_mode)))
+		return airoha_xpon_gpon_irq(xpon);
 
 	return airoha_xpon_xgpon_irq(xpon);
 }
@@ -120,6 +125,9 @@ static int airoha_xpon_prepare_frontend_locked(struct airoha_xpon *xpon)
 		return 0;
 	}
 
+	if (airoha_xpon_mode_is_gpon(xpon->active_mode))
+		return airoha_xpon_gpon_prepare(xpon);
+
 	return airoha_xpon_xgpon_prepare(xpon);
 }
 
@@ -128,6 +136,9 @@ static int airoha_xpon_activate_rx_locked(struct airoha_xpon *xpon)
 	if (airoha_xpon_mode_is_epon(xpon->active_mode))
 		return airoha_xpon_epon_start_rx(xpon);
 
+	if (airoha_xpon_mode_is_gpon(xpon->active_mode))
+		return airoha_xpon_gpon_start_rx(xpon);
+
 	return airoha_xpon_xgpon_start_rx(xpon);
 }
 
@@ -135,6 +146,8 @@ static void airoha_xpon_deactivate_rx_locked(struct airoha_xpon *xpon)
 {
 	if (airoha_xpon_mode_is_epon(xpon->active_mode))
 		airoha_xpon_epon_stop_rx(xpon);
+	else if (airoha_xpon_mode_is_gpon(xpon->active_mode))
+		airoha_xpon_gpon_stop_rx(xpon);
 	else
 		airoha_xpon_xgpon_stop_rx(xpon);
 
@@ -241,6 +254,9 @@ static void airoha_xpon_controller_stop(void *priv)
 		WRITE_ONCE(xpon->tx_armed, false);
 		airoha_pon_frontend_set_tx_enable(xpon->frontend, false);
 		airoha_xpon_epon_mask_irqs(xpon);
+	} else if (airoha_xpon_mode_is_gpon(READ_ONCE(xpon->active_mode))) {
+		airoha_xpon_disarm_upstream(xpon, "netdev-stop-early");
+		airoha_xpon_gpon_mask_irqs(xpon);
 	} else {
 		airoha_xpon_disarm_upstream(xpon, "netdev-stop-early");
 		airoha_xpon_xgpon_mask_irqs(xpon);
@@ -255,6 +271,8 @@ static void airoha_xpon_controller_stop(void *priv)
 	/* Mask IRQs again after workers that may have changed enable bits. */
 	if (epon)
 		airoha_xpon_epon_mask_irqs(xpon);
+	else if (airoha_xpon_mode_is_gpon(READ_ONCE(xpon->active_mode)))
+		airoha_xpon_gpon_mask_irqs(xpon);
 	else
 		airoha_xpon_xgpon_mask_irqs(xpon);
 	synchronize_irq(xpon->mac_irq);
@@ -384,6 +402,11 @@ static void airoha_xpon_advance_rx_locked(struct airoha_xpon *xpon,
 {
 	int ret;
 
+	if (airoha_xpon_mode_is_gpon(xpon->active_mode)) {
+		airoha_xpon_gpon_advance(xpon, phy_events, delay);
+		return;
+	}
+
 	if (!airoha_xpon_mode_is_epon(xpon->active_mode)) {
 		airoha_xpon_xgpon_advance(xpon, phy_events, delay);
 		return;
@@ -439,6 +462,8 @@ static void airoha_xpon_link_work(struct work_struct *work)
 		xpon->optical_signal = optical.signal_present;
 	} else if (airoha_xpon_mode_is_epon(xpon->active_mode)) {
 		xpon->optical_signal = !airoha_xpon_epon_los(xpon);
+	} else if (airoha_xpon_mode_is_gpon(xpon->active_mode)) {
+		xpon->optical_signal = !airoha_xpon_gpon_los(xpon);
 	} else {
 		xpon->optical_signal = !airoha_xpon_xgpon_los(xpon);
 	}
@@ -446,8 +471,13 @@ static void airoha_xpon_link_work(struct work_struct *work)
 
 	/* IRQ queues Deactivate; link_work commits the plain MAC reset under state_lock. */
 	if (!airoha_xpon_mode_is_epon(xpon->active_mode)) {
-		if (atomic_xchg(&xpon->mac_restart_pending, 0))
-			airoha_xpon_xgpon_restart_mac(xpon, "OLT Deactivate");
+		if (airoha_xpon_mode_is_gpon(xpon->active_mode)) {
+			if (atomic_xchg(&xpon->mac_restart_pending, 0))
+				airoha_xpon_gpon_restart_mac(xpon, "OLT Deactivate");
+		} else {
+			if (atomic_xchg(&xpon->mac_restart_pending, 0))
+				airoha_xpon_xgpon_restart_mac(xpon, "OLT Deactivate");
+		}
 		if (atomic_xchg(&xpon->data_path_retry_pending, 0))
 			airoha_xpon_retry_data_paths(xpon);
 	}
@@ -458,7 +488,9 @@ static void airoha_xpon_link_work(struct work_struct *work)
 	airoha_xpon_advance_rx_locked(xpon, phy_events, &delay);
 
 out_requeue:
-	if (!airoha_xpon_mode_is_epon(xpon->active_mode))
+	if (airoha_xpon_mode_is_gpon(xpon->active_mode))
+		airoha_xpon_gpon_counters_update(xpon);
+	else if (!airoha_xpon_mode_is_epon(xpon->active_mode))
 		airoha_xpon_xgpon_counters_update(xpon);
 	requeue = !xpon->stopping;
 	mutex_unlock(&xpon->state_lock);

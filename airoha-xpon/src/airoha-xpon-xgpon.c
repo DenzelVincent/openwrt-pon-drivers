@@ -496,6 +496,8 @@ int airoha_xpon_xgpon_start_rx(struct airoha_xpon *xpon)
 
 	pcs_mode = xpon->active_mode == AIROHA_XPON_MODE_XGSPON ?
 	                   AIROHA_PCS_PON_MODE_XGSPON :
+	           xpon->active_mode == AIROHA_XPON_MODE_GPON ?
+	                   AIROHA_PCS_PON_MODE_GPON :
 	                   AIROHA_PCS_PON_MODE_XGPON;
 	retrain = xpon->pcs_profile_valid && xpon->pcs_profile == pcs_mode;
 	if (!retrain) {

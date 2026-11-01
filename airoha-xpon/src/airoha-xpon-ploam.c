@@ -24,38 +24,81 @@ void airoha_xpon_disarm_upstream(struct airoha_xpon *xpon, const char *reason)
 			xpon->dev,
 			"failed to disable optical frontend burst gate (%s): %d\n",
 			reason, ret);
+	airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_CTRL, "arm-off",
+			  "reason=%s gate_ret=%d\n", reason, ret);
 }
+
+/* 第 7 段的前置条件位图：每一位对应一个挡住上行开通的原因。 */
+#define AIROHA_XPON_ARM_STOPPING	BIT(0)
+#define AIROHA_XPON_ARM_NO_SIGNAL	BIT(1)
+#define AIROHA_XPON_ARM_NO_MAC		BIT(2)
+#define AIROHA_XPON_ARM_NO_IK		BIT(3)
+#define AIROHA_XPON_ARM_NO_AK		BIT(4)
+#define AIROHA_XPON_ARM_NO_SERIAL	BIT(5)
+#define AIROHA_XPON_ARM_NO_PROFILE	BIT(6)
+#define AIROHA_XPON_ARM_NO_STATE	BIT(7)
+#define AIROHA_XPON_ARM_NO_PMA_READY	BIT(8)
+#define AIROHA_XPON_ARM_NO_TX_SYNC	BIT(9)
 
 int airoha_xpon_try_arm_upstream(struct airoha_xpon *xpon)
 {
 	u32 phy_status, sync;
 	u32 sync_state;
+	u32 blocked = 0;
 	int ret;
 
 	if (READ_ONCE(xpon->tx_armed))
 		return 0;
-	if (READ_ONCE(xpon->stopping) || !xpon->optical_signal ||
-	    !xpon->mac_initialized ||
-	    !xpon->crypto.default_ploam_ik_programmed ||
-	    !xpon->crypto.activation_keys_programmed ||
-	    !xpon->identity.active_identity.serial_configured ||
-	    !READ_ONCE(xpon->burst_profile_programmed))
-		return 0;
+	if (READ_ONCE(xpon->stopping))
+		blocked |= AIROHA_XPON_ARM_STOPPING;
+	if (!xpon->optical_signal)
+		blocked |= AIROHA_XPON_ARM_NO_SIGNAL;
+	if (!xpon->mac_initialized)
+		blocked |= AIROHA_XPON_ARM_NO_MAC;
+	if (!xpon->crypto.default_ploam_ik_programmed)
+		blocked |= AIROHA_XPON_ARM_NO_IK;
+	if (!xpon->crypto.activation_keys_programmed)
+		blocked |= AIROHA_XPON_ARM_NO_AK;
+	if (!xpon->identity.active_identity.serial_configured)
+		blocked |= AIROHA_XPON_ARM_NO_SERIAL;
+	if (!READ_ONCE(xpon->burst_profile_programmed))
+		blocked |= AIROHA_XPON_ARM_NO_PROFILE;
 	if (xpon->onu_state != AIROHA_XGPON_O2_3 &&
 	    xpon->onu_state != AIROHA_XGPON_O4 &&
 	    xpon->onu_state != AIROHA_XGPON_O5)
-		return 0;
+		blocked |= AIROHA_XPON_ARM_NO_STATE;
 
-	phy_status = airoha_pon_phy_read(xpon, AIROHA_XGPON_PHY_XG_PHY_STA);
-	sync = airoha_pon_phy_read(xpon, AIROHA_XGPON_PHY_DBG_RX_SYNC_ST);
-	sync_state = FIELD_GET(AIROHA_XGPON_PHY_RX_SYNC_MASK, sync);
-	if (!(phy_status & AIROHA_XGPON_PHY_PHYA_READY) ||
-	    sync_state != AIROHA_XGPON_PHY_RX_SYNC_IN)
+	/* 软件条件未满足时不碰寄存器，保持与原先短路返回相同的 MMIO 次数。 */
+	if (!blocked) {
+		phy_status = airoha_pon_phy_read(xpon, AIROHA_XGPON_PHY_XG_PHY_STA);
+		sync = airoha_pon_phy_read(xpon, AIROHA_XGPON_PHY_DBG_RX_SYNC_ST);
+		sync_state = FIELD_GET(AIROHA_XGPON_PHY_RX_SYNC_MASK, sync);
+		if (!(phy_status & AIROHA_XGPON_PHY_PHYA_READY) ||
+		    sync_state != AIROHA_XGPON_PHY_RX_SYNC_IN)
+			blocked |= AIROHA_XPON_ARM_NO_PMA_READY;
+		/* DBG_RESYNC[31] reports TX synchronization before opening the burst gate. */
+		if (!(airoha_xgpon_read(xpon, AIROHA_XGPON_DBG_RESYNC) &
+		      AIROHA_XGPON_TX_SYNC_READY))
+			blocked |= AIROHA_XPON_ARM_NO_TX_SYNC;
+	}
+
+	/*
+	 * 阻塞集合每变化一次只出一行：这一位图是"上行一直没开"的唯一原因证据，逐轮打
+	 * 会淹没时间线，只在集合变化时打则既能看出卡在哪一项、也能看出何时换项。
+	 */
+	if (blocked) {
+		if (blocked != xpon->trace_arm_block) {
+			xpon->trace_arm_block = blocked;
+			airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_CTRL,
+					  "arm-blocked",
+					  "blocked=0x%03x state=%s onu_id=%u\n",
+					  blocked,
+					  airoha_xpon_onu_state_name(xpon->onu_state),
+					  xpon->onu_id);
+		}
 		return 0;
-	/* DBG_RESYNC[31] reports TX synchronization before opening the burst gate. */
-	if (!(airoha_xgpon_read(xpon, AIROHA_XGPON_DBG_RESYNC) &
-	      AIROHA_XGPON_TX_SYNC_READY))
-		return 0;
+	}
+	xpon->trace_arm_block = 0;
 
 	/* TX-late monitoring starts with a valid burst profile. */
 	airoha_xgpon_write(xpon, AIROHA_XGPON_TX_ERR_STS, U32_MAX);
@@ -67,6 +110,9 @@ int airoha_xpon_try_arm_upstream(struct airoha_xpon *xpon)
 	/* MAC grants and PMA BEN jointly control optical bursts. */
 	ret = airoha_pon_frontend_set_tx_enable(xpon->frontend, true);
 	if (ret) {
+		airoha_xpon_fail(xpon, AIROHA_XPON_TRACE_SEG_CTRL, "arm-gate", ret,
+				 "state=%s\n",
+				 airoha_xpon_onu_state_name(xpon->onu_state));
 		airoha_xgpon_update_bits(xpon, AIROHA_XGPON_INT_ENABLE,
 		                         AIROHA_XGPON_INT_TX_ERROR, 0);
 		return ret;
@@ -77,6 +123,10 @@ int airoha_xpon_try_arm_upstream(struct airoha_xpon *xpon)
 		xpon->dev,
 		"upstream TX enabled: SN=%s, PHY/XGTC/profile ready, frontend enable accepted\n",
 		xpon->identity.active_identity.serial_source);
+	airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_CTRL, "arm-on",
+			  "state=%s onu_id=%u rx_starts=%u\n",
+			  airoha_xpon_onu_state_name(xpon->onu_state),
+			  xpon->onu_id, xpon->stats.rx_start_count);
 
 	return 0;
 }
@@ -387,6 +437,15 @@ static int airoha_xpon_apply_data_paths_locked(
 
 out_ploam:
 	mutex_unlock(&xpon->ploam_lock);
+	/* -EAGAIN 是"等 PLOAM 发 Alloc-ID"的正常等待，不当失败上报。 */
+	if (ret && ret != -EAGAIN)
+		airoha_xpon_fail(xpon, AIROHA_XPON_TRACE_SEG_DATA,
+				 "data-paths-apply", ret,
+				 "count=%u state=%s mac_init=%d configured=%d\n",
+				 count,
+				 airoha_xpon_onu_state_name(xpon->onu_state),
+				 xpon->mac_initialized,
+				 xpon->data_path.configured);
 	return ret;
 }
 
@@ -397,8 +456,12 @@ int airoha_xpon_replace_data_paths(
 	unsigned int i, j;
 	int ret;
 
-	if (!count || count > AIROHA_XPON_MAX_DATA_PATHS)
+	if (!count || count > AIROHA_XPON_MAX_DATA_PATHS) {
+		airoha_xpon_fail(xpon, AIROHA_XPON_TRACE_SEG_DATA, "data-paths-count",
+				 -EINVAL, "count=%u max=%u\n", count,
+				 AIROHA_XPON_MAX_DATA_PATHS);
 		return -EINVAL;
+	}
 	for (i = 0; i < count; i++) {
 		if ((!requested[i].multicast &&
 		     requested[i].alloc_id > 0x3fff) ||
@@ -406,8 +469,17 @@ int airoha_xpon_replace_data_paths(
 		     requested[i].alloc_id != 0xffff) ||
 		    (requested[i].vlan_id > 4094 &&
 		     requested[i].vlan_id != AIROHA_PON_VID_ANY) ||
-		    !requested[i].pbit_mask)
+		    !requested[i].pbit_mask) {
+			/* 参数非法来自 pond/OMCI 映射，驱动侧原本完全静默。 */
+			airoha_xpon_fail(xpon, AIROHA_XPON_TRACE_SEG_DATA,
+					 "data-paths-entry", -EINVAL,
+					 "index=%u alloc_id=0x%04x gem_id=0x%04x vlan=%u pbit=0x%02x mc=%d\n",
+					 i, requested[i].alloc_id,
+					 requested[i].gem_id, requested[i].vlan_id,
+					 requested[i].pbit_mask,
+					 requested[i].multicast);
 			return -EINVAL;
+		}
 		/*
 		 * VID_ANY covers untagged frames and tagged frames after VID lookup.
 		 * Equal VID/P-bit selectors conflict.
@@ -415,8 +487,14 @@ int airoha_xpon_replace_data_paths(
 		for (j = 0; !requested[i].multicast && j < i; j++)
 			if (!requested[j].multicast &&
 			    requested[i].vlan_id == requested[j].vlan_id &&
-			    requested[i].pbit_mask & requested[j].pbit_mask)
+			    requested[i].pbit_mask & requested[j].pbit_mask) {
+				airoha_xpon_fail(xpon, AIROHA_XPON_TRACE_SEG_DATA,
+						 "data-paths-conflict", -EINVAL,
+						 "index=%u vlan=%u pbit=0x%02x\n",
+						 i, requested[i].vlan_id,
+						 requested[i].pbit_mask);
 				return -EINVAL;
+			}
 	}
 
 	mutex_lock(&xpon->state_lock);
@@ -882,6 +960,19 @@ static int airoha_xpon_accept_assign_onu_id(struct airoha_xpon *xpon,
 		dev_dbg(xpon->dev,
 		        "Assign ONU-ID ignored: serial mismatch, offered ONU-ID=%u\n",
 		        onu_id);
+		/*
+		 * SN 不匹配是第 6 段最常见的"OLT 根本不认这台 ONU"，原来只有 dev_dbg
+		 * (不可见)。pon-trace 里带上两侧 SN 的前 3 字节，够判断是配置错还是 OLT
+		 * 分配给了别的 ONU。
+		 */
+		airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_PLOAM, "assign-onu-id",
+				  "result=sn-mismatch offered=%u dest=%u ploam_sn=0x%06x local_sn=0x%06x state=%s\n",
+				  onu_id, dest,
+				  (message[6] << 16) | (message[7] << 8) | message[8],
+				  (xpon->identity.active_identity.serial_number[0] << 16) |
+					  (xpon->identity.active_identity.serial_number[1] << 8) |
+					  xpon->identity.active_identity.serial_number[2],
+				  airoha_xpon_onu_state_name(xpon->onu_state));
 		return -EINVAL;
 	}
 

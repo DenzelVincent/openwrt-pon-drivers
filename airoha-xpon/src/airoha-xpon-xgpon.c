@@ -136,9 +136,29 @@ out_restore:
 	return ret;
 }
 
+const char *airoha_xpon_onu_state_name(enum airoha_xgpon_onu_state state)
+{
+	switch (state) {
+	case AIROHA_XGPON_O1:
+		return "O1";
+	case AIROHA_XGPON_O2_3:
+		return "O2_3";
+	case AIROHA_XGPON_O4:
+		return "O4";
+	case AIROHA_XGPON_O5:
+		return "O5";
+	case AIROHA_XGPON_O7:
+		return "O7";
+	}
+	return "O?";
+}
+
 void airoha_xpon_set_onu_state(struct airoha_xpon *xpon,
                                enum airoha_xgpon_onu_state state)
 {
+	enum airoha_xgpon_onu_state prev = xpon->onu_state;
+	u32 activation;
+
 	/* ACTIVATION_ST commits the ONU-ID, EqD, and T-CONT settings together. */
 	airoha_xgpon_update_bits(xpon, AIROHA_XGPON_ACTIVATION_ST,
 	                         AIROHA_XGPON_ACTIVATION_STATE_MASK,
@@ -146,6 +166,17 @@ void airoha_xpon_set_onu_state(struct airoha_xpon *xpon,
 	                                    state));
 	xpon->onu_state = state;
 	airoha_xpon_leds_update(xpon);
+
+	/*
+	 * 状态跃迁每次出一行。回读 ACTIVATION_ST 用来区分"驱动自己记到了 O4"和"硬件
+	 * 真的进到 O4"——GPON 的第 6 段之前完全没有可观测性，只有 debugfs 里的静态值。
+	 */
+	activation = airoha_xgpon_read(xpon, AIROHA_XGPON_ACTIVATION_ST);
+	airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_PLOAM, "onu-state",
+			  "state=%s prev=%s onu_id=%u eqd=%u activation=0x%08x\n",
+			  airoha_xpon_onu_state_name(state),
+			  airoha_xpon_onu_state_name(prev), xpon->onu_id,
+			  xpon->eqd, activation);
 }
 
 void airoha_xpon_update_omci_link(struct airoha_xpon *xpon)
@@ -169,6 +200,16 @@ void airoha_xpon_update_omci_link(struct airoha_xpon *xpon)
 	                          ready ? xpon->onu_id :
 	                                  AIROHA_XGPON_BROADCAST_ID,
 	                          !!(key_index & AIROHA_XGPON_CUR_OIK_INDEX));
+	/*
+	 * OMCI 通道打开需要 5 个条件同时成立，这一行把当时的每个条件都写出来：OMCI
+	 * 不通时能直接看出卡在密钥、tx_armed 还是 ONU-ID。
+	 */
+	airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_CTRL, "omci-link",
+			  "ready=%d state=%s onu_id=%u ik=%d ak=%d tx_armed=%d cur_kidx=0x%08x\n",
+			  ready, airoha_xpon_onu_state_name(xpon->onu_state),
+			  xpon->onu_id, xpon->crypto.default_ploam_ik_programmed,
+			  xpon->crypto.activation_keys_programmed,
+			  READ_ONCE(xpon->tx_armed), key_index);
 }
 
 static void airoha_xpon_xgpon_program_identity(struct airoha_xpon *xpon)
@@ -500,6 +541,10 @@ int airoha_xpon_xgpon_start_rx(struct airoha_xpon *xpon)
 	                   AIROHA_PCS_PON_MODE_GPON :
 	                   AIROHA_PCS_PON_MODE_XGPON;
 	retrain = xpon->pcs_profile_valid && xpon->pcs_profile == pcs_mode;
+	airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_MAC, "pcs-path",
+			  "retrain=%d profile=%u profile_valid=%d setting0=0x%08x\n",
+			  retrain, xpon->pcs_profile, xpon->pcs_profile_valid,
+			  xpon->frontend_link.pma_xpon_setting0);
 	if (!retrain) {
 		ret = airoha_pcs_pon_config_rx(
 			xpon->pcs, pcs_mode,
@@ -508,6 +553,10 @@ int airoha_xpon_xgpon_start_rx(struct airoha_xpon *xpon)
 		if (!ret) {
 			xpon->pcs_profile = pcs_mode;
 			xpon->pcs_profile_valid = true;
+		} else {
+			airoha_xpon_fail(xpon, AIROHA_XPON_TRACE_SEG_ANA,
+					 "pcs-config", ret, "profile=%u\n",
+					 pcs_mode);
 		}
 	} else {
 		usleep_range(2000, 2500);
@@ -515,6 +564,9 @@ int airoha_xpon_xgpon_start_rx(struct airoha_xpon *xpon)
 		usleep_range(1000, 1200);
 		ret = airoha_pcs_pon_retrain_rx(xpon->pcs);
 		if (ret) {
+			airoha_xpon_fail(xpon, AIROHA_XPON_TRACE_SEG_PMA,
+					 "pcs-retrain", ret, "profile=%u\n",
+					 xpon->pcs_profile);
 			airoha_xpon_xgpon_release_digital_rx_reset(xpon);
 			return ret;
 		}
@@ -533,13 +585,17 @@ int airoha_xpon_xgpon_start_rx(struct airoha_xpon *xpon)
 	} else {
 		ret = airoha_xpon_xgpon_reset_and_enable_digital_rx(xpon);
 	}
-	if (ret)
+	if (ret) {
+		airoha_xpon_fail(xpon, AIROHA_XPON_TRACE_SEG_MAC, "digital-rx",
+				 ret, "retrain=%d\n", retrain);
 		return ret;
+	}
 
 	xpon->lifecycle = AIROHA_XPON_WAIT_LINE_SYNC;
 	xpon->rx_active = true;
 	xpon->stats.rx_start_count++;
 	xpon->no_sync_since = jiffies;
+	xpon->trace_sync_seen = 0;
 
 	onu_id = airoha_xgpon_read(xpon, AIROHA_XGPON_ONU_ID);
 	dev_info(
@@ -547,6 +603,9 @@ int airoha_xpon_xgpon_start_rx(struct airoha_xpon *xpon)
 		"XG-PON RX started, irq=%d, ONU-ID=%lu (%s), burst TX remains disabled\n",
 		xpon->mac_irq, FIELD_GET(AIROHA_XGPON_ONU_ID_MASK, onu_id),
 		onu_id & AIROHA_XGPON_ONU_ID_VALID ? "valid" : "invalid");
+	airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_MAC, "rx-started",
+			  "retrain=%d rx_starts=%u onu_id_raw=0x%08x\n", retrain,
+			  xpon->stats.rx_start_count, onu_id);
 
 	return 0;
 }
@@ -622,6 +681,13 @@ void airoha_xpon_xgpon_stop_rx(struct airoha_xpon *xpon)
 	xpon->burst_profile_programmed = false;
 	xpon->rx_active = false;
 	xpon->lifecycle = AIROHA_XPON_WAIT_OPTICAL_SIGNAL;
+
+	airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_MAC, "rx-stopped",
+			  "pcs_stop_ret=%d rx_starts=%u recoveries=%u sync_seen=0x%02x\n",
+			  ret, xpon->stats.rx_start_count,
+			  xpon->stats.no_ready_recovery_count,
+			  xpon->trace_sync_seen);
+	xpon->trace_sync_seen = 0;
 }
 
 void airoha_xpon_xgpon_restart_mac(struct airoha_xpon *xpon, const char *reason)
@@ -646,6 +712,10 @@ void airoha_xpon_xgpon_restart_mac(struct airoha_xpon *xpon, const char *reason)
 
 	dev_info(xpon->dev, "XG-PON MAC epoch reset (%s); PHY RX retained\n",
 	         reason);
+	airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_MAC, "mac-restart",
+			  "reason=%s sync_seen=0x%02x rx_starts=%u\n", reason,
+			  xpon->trace_sync_seen, xpon->stats.rx_start_count);
+	xpon->trace_sync_seen = 0;
 }
 
 static void airoha_xpon_xgpon_recover_no_sync(struct airoha_xpon *xpon,
@@ -669,6 +739,11 @@ static void airoha_xpon_xgpon_recover_no_sync(struct airoha_xpon *xpon,
 	full_reinit = (xpon->stats.no_ready_recovery_count + 3) %
 	                      AIROHA_XPON_FULL_REINIT_PERIOD ==
 	              0;
+	/* 原有的 dev_warn_ratelimited 会被限流丢掉，这一行保证恢复轮次可数。 */
+	airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_RX, "recover-no-sync",
+			  "recovery=%u full_reinit=%d sync_seen=0x%02x rx_starts=%u\n",
+			  xpon->stats.no_ready_recovery_count, full_reinit,
+			  xpon->trace_sync_seen, xpon->stats.rx_start_count);
 	airoha_xpon_xgpon_stop_rx(xpon);
 	if (full_reinit) {
 		airoha_xpon_xgpon_hold_digital_rx_reset(xpon);
@@ -689,6 +764,10 @@ static void airoha_xpon_xgpon_recover_no_sync(struct airoha_xpon *xpon,
 	if (ret) {
 		xpon->last_start_error = ret;
 		xpon->lifecycle = AIROHA_XPON_ERROR;
+		airoha_xpon_fail(xpon, AIROHA_XPON_TRACE_SEG_RX,
+				 "recovery-start-rx", ret,
+				 "recovery=%u full_reinit=%d\n",
+				 xpon->stats.no_ready_recovery_count, full_reinit);
 		*delay = msecs_to_jiffies(AIROHA_XPON_RETRAIN_RETRY_MS);
 	} else {
 		xpon->last_start_error = 0;
@@ -702,6 +781,15 @@ static void airoha_xpon_xgpon_advance_xgtc(struct airoha_xpon *xpon,
 	u32 sync_state = FIELD_GET(AIROHA_XGPON_PHY_RX_SYNC_MASK, sync);
 	int ret;
 
+	/* 与 GPON 侧同一套按值置位的首见日志，用于 XG-PON/GPON 时间线对齐比对。 */
+	if (!(xpon->trace_sync_seen & BIT(sync_state))) {
+		xpon->trace_sync_seen |= BIT(sync_state);
+		airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_GTC, "xgtc-sync-state",
+				  "state=%u raw=0x%08x mac_init=%d rx_active=%d\n",
+				  sync_state, sync, xpon->mac_initialized,
+				  xpon->rx_active);
+	}
+
 	if (sync_state == AIROHA_XGPON_PHY_RX_SYNC_IN) {
 		xpon->no_sync_since = 0;
 		xpon->stats.no_ready_recovery_count = 0;
@@ -710,6 +798,9 @@ static void airoha_xpon_xgpon_advance_xgtc(struct airoha_xpon *xpon,
 			if (ret) {
 				xpon->last_start_error = ret;
 				xpon->lifecycle = AIROHA_XPON_ERROR;
+				airoha_xpon_fail(xpon, AIROHA_XPON_TRACE_SEG_GTC,
+						 "start-control", ret,
+						 "sync_state=%u\n", sync_state);
 				*delay = msecs_to_jiffies(
 					AIROHA_XPON_RETRAIN_RETRY_MS);
 				return;
@@ -718,6 +809,9 @@ static void airoha_xpon_xgpon_advance_xgtc(struct airoha_xpon *xpon,
 		ret = airoha_xpon_try_arm_upstream(xpon);
 		if (ret) {
 			xpon->last_start_error = ret;
+			airoha_xpon_fail(xpon, AIROHA_XPON_TRACE_SEG_CTRL,
+					 "arm-upstream", ret,
+					 "sync_state=%u\n", sync_state);
 			dev_warn_ratelimited(
 				xpon->dev,
 				"failed to arm upstream BEN: %d; remaining receive-only and retrying\n",

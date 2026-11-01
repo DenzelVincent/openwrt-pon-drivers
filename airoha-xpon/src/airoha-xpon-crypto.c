@@ -143,9 +143,19 @@ int airoha_xpon_program_activation_keys(struct airoha_xpon *xpon)
 		"XG-PON activation key groups generated: PON-Tag=%08x%08x, group1 active; hardware switches to group0 in O4\n",
 		xpon->crypto.activation_pon_tag1,
 		xpon->crypto.activation_pon_tag0);
+	airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_CTRL, "ak-generated",
+			  "pon_tag=0x%08x%08x sw_set_kidx=0x%08x runs=%u\n",
+			  xpon->crypto.activation_pon_tag1,
+			  xpon->crypto.activation_pon_tag0,
+			  airoha_xgpon_read(xpon, AIROHA_XGPON_SW_SET_KIDX),
+			  xpon->crypto.generation_runs);
 	return 0;
 
 fail:
+	airoha_xpon_fail(xpon, AIROHA_XPON_TRACE_SEG_CTRL, "ak-generate", ret,
+			 "failed_type=0x%x runs=%u\n",
+			 xpon->crypto.generation_failed_type,
+			 xpon->crypto.generation_runs);
 	dev_err(xpon->dev,
 	        "XG-PON activation key generation timed out: type=0x%x ret=%d; upstream remains disabled\n",
 	        xpon->crypto.generation_failed_type, ret);

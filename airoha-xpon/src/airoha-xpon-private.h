@@ -265,6 +265,16 @@ struct airoha_xpon {
 	enum airoha_xgpon_onu_state onu_state;
 	u16 onu_id;
 	u32 eqd;
+	/*
+	 * 取证用：本 MAC 周期内出现过的 GTC/XGTC 同步态按值置位，每个新状态只打
+	 * 一行 pon-trace，避免 250ms 轮询把 dmesg 冲掉。
+	 */
+	u8 trace_sync_seen;
+	/*
+	 * 取证用：上行开通(第7段)被哪几个前置条件挡住，按位累积；只在集合发生
+	 * 变化时出一行，避免 250ms 轮询把 dmesg 冲掉。
+	 */
+	u32 trace_arm_block;
 	bool optical_signal;
 	/* The PCS profile identifies retained PMA calibration and line rate. */
 	enum airoha_pcs_pon_mode pcs_profile;
@@ -345,6 +355,7 @@ static inline u32 airoha_xpon_bytes_to_u32(const u8 *bytes)
 
 void airoha_xpon_set_onu_state(struct airoha_xpon *xpon,
                                enum airoha_xgpon_onu_state state);
+const char *airoha_xpon_onu_state_name(enum airoha_xgpon_onu_state state);
 void airoha_xpon_set_data_path_link(struct airoha_xpon *xpon, bool ready);
 void airoha_xpon_update_omci_link(struct airoha_xpon *xpon);
 const struct airoha_xpon_mode_info *
@@ -406,5 +417,43 @@ void airoha_xpon_xgpon_counters_update(struct airoha_xpon *xpon);
 void airoha_xpon_debugfs_init(struct airoha_xpon *xpon);
 void airoha_xpon_debugfs_remove(struct airoha_xpon *xpon);
 extern const struct attribute_group *airoha_xpon_groups[];
+
+/*
+ * 全链路取证日志。掩码 bit0..bit7 对应改造文档第一节的第 1..8 段，默认 0xff：
+ * 每段每轮只出一行，一次 boot 约 60~250 行，换取"能沿基线表逐段判读"的可见性。
+ * 运行时关闭：echo 0 > /sys/module/airoha_xpon/parameters/pon_trace
+ *
+ * 用 dev_info 而不是 dev_dbg：PON bringup 路径上 dynamic debug 实测无效（历史轮次
+ * 的逐步 dev_dbg 从未打印过），可见性只能由本掩码控制。第 2、3 段由内核侧 PCS
+ * 用同一编号打印，两侧可按 seg= 对齐同一次 bringup 的时间线。
+ */
+#define AIROHA_XPON_TRACE_SEG_RX	1
+#define AIROHA_XPON_TRACE_SEG_PMA	2
+#define AIROHA_XPON_TRACE_SEG_ANA	3
+#define AIROHA_XPON_TRACE_SEG_MAC	4
+#define AIROHA_XPON_TRACE_SEG_GTC	5
+#define AIROHA_XPON_TRACE_SEG_PLOAM	6
+#define AIROHA_XPON_TRACE_SEG_CTRL	7
+#define AIROHA_XPON_TRACE_SEG_DATA	8
+
+extern u8 airoha_xpon_trace_mask;
+
+#define airoha_xpon_trace(xpon, seg, stage, fmt, ...)			\
+	do {								\
+		if (READ_ONCE(airoha_xpon_trace_mask) & BIT((seg) - 1))	\
+			dev_info((xpon)->dev,				\
+				 "pon-trace: seg=%u stage=%s mode=%s " fmt, \
+				 (u32)(seg), (stage),			\
+				 airoha_xpon_mode_name((xpon)->active_mode), \
+				 ##__VA_ARGS__);			\
+	} while (0)
+
+/* 失败行不受掩码控制：seg/stage/mode/ret 固定成键，供 awk 直接聚合。 */
+#define airoha_xpon_fail(xpon, seg, stage, ret, fmt, ...)		\
+	dev_warn((xpon)->dev,						\
+		 "pon-fail: seg=%u stage=%s mode=%s ret=%d " fmt,	\
+		 (u32)(seg), (stage),					\
+		 airoha_xpon_mode_name((xpon)->active_mode), (int)(ret),	\
+		 ##__VA_ARGS__)
 
 #endif

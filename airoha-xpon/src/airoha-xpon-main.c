@@ -27,6 +27,15 @@
 #include "airoha-xpon-omci.h"
 #include "airoha-xpon-xgpon.h"
 
+/*
+ * 全链路取证日志掩码，位定义见 airoha-xpon-private.h。默认 0xff 是因为 GPON 还在
+ * 排查期，需要一份能逐段判读的 bundle；0 退回到只有摘要行的行为。
+ */
+u8 airoha_xpon_trace_mask = 0xff;
+module_param_named(pon_trace, airoha_xpon_trace_mask, byte, 0644);
+MODULE_PARM_DESC(pon_trace,
+	"pon-trace log mask, bit0..bit7 = stage 1..8 (default 0xff, 0 disables)");
+
 void airoha_xpon_set_data_path_link(struct airoha_xpon *xpon, bool ready)
 {
 	/*
@@ -41,6 +50,10 @@ void airoha_xpon_set_data_path_link(struct airoha_xpon *xpon, bool ready)
 		netif_carrier_off(xpon->pon_netdev);
 		netif_tx_stop_all_queues(xpon->pon_netdev);
 	}
+	airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_DATA, "data-path-link",
+			  "netdev=%s ready=%d mapped=%u configured=%d\n",
+			  netdev_name(xpon->pon_netdev), ready,
+			  xpon->data_path.count, xpon->data_path.configured);
 }
 
 static irqreturn_t airoha_xpon_irq(int irq, void *data)
@@ -116,8 +129,20 @@ static int airoha_xpon_prepare_frontend_locked(struct airoha_xpon *xpon)
 	if (ret)
 		return ret;
 	ret = airoha_pon_frontend_prepare(xpon->frontend, mode->frontend_mode);
-	if (ret)
+	if (ret) {
+		airoha_xpon_fail(xpon, AIROHA_XPON_TRACE_SEG_RX,
+				 "frontend-prepare", ret, "frontend_mode=%d\n",
+				 mode->frontend_mode);
 		return ret;
+	}
+
+	/* 前端档位与 PMA 电气参数是第2/3段的输入，先在这里留一行证据。 */
+	airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_RX, "frontend-prepared",
+			  "frontend_mode=%d setting0=0x%08x setting1=0x%08x sfp_valid=%u\n",
+			  mode->frontend_mode,
+			  xpon->frontend_link.pma_xpon_setting0,
+			  xpon->frontend_link.pma_xpon_setting1,
+			  xpon->frontend_link.xgpon_sfp_valid_level);
 
 	if (airoha_xpon_mode_is_epon(xpon->active_mode)) {
 		airoha_xpon_epon_mask_irqs(xpon);
@@ -133,13 +158,31 @@ static int airoha_xpon_prepare_frontend_locked(struct airoha_xpon *xpon)
 
 static int airoha_xpon_activate_rx_locked(struct airoha_xpon *xpon)
 {
+	int ret;
+
+	/*
+	 * 掩码在每次 bringup 前下发，改 /sys 参数后下一轮 rx_start 就生效；PCS 是
+	 * built-in，没有自己的运行时开关。
+	 */
+	airoha_pcs_pon_set_trace(xpon->pcs, READ_ONCE(airoha_xpon_trace_mask));
+	airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_MAC, "activate",
+			  "lifecycle=%d profile=%u profile_valid=%d rx_active=%d rx_starts=%u\n",
+			  xpon->lifecycle, xpon->pcs_profile,
+			  xpon->pcs_profile_valid, xpon->rx_active,
+			  xpon->stats.rx_start_count);
+
 	if (airoha_xpon_mode_is_epon(xpon->active_mode))
-		return airoha_xpon_epon_start_rx(xpon);
+		ret = airoha_xpon_epon_start_rx(xpon);
+	else if (airoha_xpon_mode_is_gpon(xpon->active_mode))
+		ret = airoha_xpon_gpon_start_rx(xpon);
+	else
+		ret = airoha_xpon_xgpon_start_rx(xpon);
+	if (ret)
+		airoha_xpon_fail(xpon, AIROHA_XPON_TRACE_SEG_MAC, "start-rx", ret,
+				 "lifecycle=%d profile=%u\n", xpon->lifecycle,
+				 xpon->pcs_profile);
 
-	if (airoha_xpon_mode_is_gpon(xpon->active_mode))
-		return airoha_xpon_gpon_start_rx(xpon);
-
-	return airoha_xpon_xgpon_start_rx(xpon);
+	return ret;
 }
 
 static void airoha_xpon_deactivate_rx_locked(struct airoha_xpon *xpon)
@@ -207,6 +250,10 @@ static int airoha_xpon_controller_start(void *priv)
 	 */
 	mutex_lock(&xpon->state_lock);
 	if (xpon->lifecycle != AIROHA_XPON_STOPPED) {
+		airoha_xpon_fail(xpon, AIROHA_XPON_TRACE_SEG_ANA, "mode-start",
+				 -EBUSY, "lifecycle=%d configured=%s\n",
+				 xpon->lifecycle,
+				 airoha_xpon_mode_name(xpon->configured_mode));
 		ret = -EBUSY;
 		goto out_unlock;
 	}
@@ -214,6 +261,10 @@ static int airoha_xpon_controller_start(void *priv)
 	if (!mode || !mode->mac_supported ||
 	    !airoha_pon_frontend_supports(xpon->frontend,
 	                                  mode->frontend_mode)) {
+		airoha_xpon_fail(xpon, AIROHA_XPON_TRACE_SEG_ANA, "mode-start",
+				 -EOPNOTSUPP, "configured=%s frontend_mode=%d\n",
+				 airoha_xpon_mode_name(xpon->configured_mode),
+				 mode ? mode->frontend_mode : -1);
 		ret = -EOPNOTSUPP;
 		xpon->last_start_error = ret;
 		goto out_unlock;
@@ -437,6 +488,7 @@ static void airoha_xpon_link_work(struct work_struct *work)
 	struct airoha_pon_frontend_signal_status optical = {};
 	unsigned long delay = msecs_to_jiffies(AIROHA_XPON_LINK_POLL_MS);
 	u32 phy_events = atomic_xchg(&xpon->phy_events, 0);
+	bool optical_prev;
 	bool requeue;
 	int ret;
 
@@ -458,6 +510,7 @@ static void airoha_xpon_link_work(struct work_struct *work)
 	}
 
 	/* The active digital PCS supplies LOS when provider signal validity is absent. */
+	optical_prev = xpon->optical_signal;
 	if (optical.signal_valid) {
 		xpon->optical_signal = optical.signal_present;
 	} else if (airoha_xpon_mode_is_epon(xpon->active_mode)) {
@@ -467,6 +520,13 @@ static void airoha_xpon_link_work(struct work_struct *work)
 	} else {
 		xpon->optical_signal = !airoha_xpon_xgpon_los(xpon);
 	}
+	/* 只在跃迁时出一行：250ms 轮询若每轮都打会把时间线冲掉。 */
+	if (optical_prev != xpon->optical_signal)
+		airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_RX, "optical-edge",
+				  "signal=%d prev=%d provider_valid=%d phy_events=0x%08x lifecycle=%d\n",
+				  xpon->optical_signal, optical_prev,
+				  optical.signal_valid, phy_events,
+				  xpon->lifecycle);
 	airoha_xpon_leds_update(xpon);
 
 	/* IRQ queues Deactivate; link_work commits the plain MAC reset under state_lock. */

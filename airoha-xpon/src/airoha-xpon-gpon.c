@@ -216,6 +216,25 @@ static void airoha_xpon_gpon_hard_reset_mac(struct airoha_xpon *xpon)
 	airoha_xpon_gpon_clear_errors(xpon, false);
 }
 
+/*
+ * 厂商 gpon_enable() 在 ResetCtrl(0) 之后调用 gpon_dev_init()：其中
+ * 0x4004 的低字节写 DBA block size（AN7581 的 init 用 0x30），并把
+ * sniff 关掉。这里只取这两项不需要板级参数的配置；响应时间/ToD 等
+ * 依赖 eFuse 的值不动。
+ */
+static void airoha_xpon_gpon_init_mac(struct airoha_xpon *xpon)
+{
+	airoha_gpon_update_bits(xpon, AIROHA_GPON_ONU_GLOBAL_CONFIG, 0xff, 0x30);
+	airoha_gpon_write(xpon, AIROHA_GPON_SNIFF_DA_SA, 0);
+	airoha_gpon_write(xpon, AIROHA_GPON_SNIFF_GEM_CNT, 0);
+
+	airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_MAC, "mac-init",
+			  "glb_cfg=0x%08x sniff_da=0x%08x sniff_cnt=0x%08x\n",
+			  airoha_gpon_read(xpon, AIROHA_GPON_ONU_GLOBAL_CONFIG),
+			  airoha_gpon_read(xpon, AIROHA_GPON_SNIFF_DA_SA),
+			  airoha_gpon_read(xpon, AIROHA_GPON_SNIFF_GEM_CNT));
+}
+
 static void airoha_xpon_gpon_program_identity(struct airoha_xpon *xpon)
 {
 	const struct airoha_xpon_identity *identity =
@@ -622,6 +641,7 @@ int airoha_xpon_gpon_start_rx(struct airoha_xpon *xpon)
 	 * 清掉复位期间残留的事件（上一份 bundle 的 0x400 就是没清的旧事件）。
 	 */
 	airoha_xpon_gpon_hard_reset_mac(xpon);
+	airoha_xpon_gpon_init_mac(xpon);
 	airoha_gpon_write(xpon, AIROHA_GPON_INT_ENABLE, 0);
 	airoha_gpon_write(xpon, AIROHA_GPON_INT_STATUS, U32_MAX);
 	xpon->gpon_gtc_last = airoha_gpon_read(xpon, AIROHA_GPON_RX_GTC_CNT);

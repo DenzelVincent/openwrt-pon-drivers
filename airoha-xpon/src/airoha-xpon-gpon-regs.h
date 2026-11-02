@@ -48,6 +48,9 @@
 #define AIROHA_GPON_SW_RESYNC        0x0364
 #define AIROHA_GPON_MAC_SET          0x03a0
 #define AIROHA_GPON_O3O4_PLOAM_CTRL  0x03c4
+/* gpon_dev_init() 关闭 sniff，避免正常接收被旁路。 */
+#define AIROHA_GPON_SNIFF_DA_SA      0x0390
+#define AIROHA_GPON_SNIFF_GEM_CNT    0x0398
 
 /*
  * ONU-ID 低 8 bit + bit15 valid；gponDevDeactiveOnu 清 valid 并把低字节写成

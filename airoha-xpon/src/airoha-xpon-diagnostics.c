@@ -110,7 +110,7 @@ int airoha_xpon_put_status(struct sk_buff *reply, struct airoha_xpon *xpon)
 		                                  "unknown" };
 	struct airoha_pon_frontend_diagnostics optics = {};
 	struct nlattr *group;
-	bool epon, active_epon;
+	bool epon, gpon, active_epon;
 	int optics_error, ret = -EMSGSIZE;
 
 	/* Read I2C telemetry outside the line-state lock used by protocol IRQs. */
@@ -120,6 +120,9 @@ int airoha_xpon_put_status(struct sk_buff *reply, struct airoha_xpon *xpon)
 	active_epon = xpon->active_mode_valid &&
 	              airoha_xpon_mode_is_epon(xpon->active_mode);
 	epon = airoha_xpon_mode_is_epon(xpon->active_mode_valid ?
+	                                        xpon->active_mode :
+	                                        xpon->configured_mode);
+	gpon = airoha_xpon_mode_is_gpon(xpon->active_mode_valid ?
 	                                        xpon->active_mode :
 	                                        xpon->configured_mode);
 
@@ -148,16 +151,23 @@ int airoha_xpon_put_status(struct sk_buff *reply, struct airoha_xpon *xpon)
 		goto out;
 	if (nla_put_u8(reply, XPON_LINE_RX_ACTIVE, xpon->rx_active))
 		goto out;
+	/*
+	 * PHY_READY/XGTC_SYNC 原是 XG-PON 口径：GPON 下 XG_PHY_STA 恒 0、
+	 * DBG_RX_SYNC_ST 恒 hunt，会让 LuCI 误报"PHY 未就绪"。GPON 改用
+	 * "RX 已开且有光"判 PHY 就绪，用 MAC 是否进 O2_3 判 GTC 状态。
+	 */
 	if (!epon &&
 	    nla_put_u8(reply, XPON_LINE_PHY_READY,
 	               xpon->rx_active &&
-	                       !!(airoha_pon_phy_read(
+	                       (gpon ? xpon->optical_signal :
+	                               !!(airoha_pon_phy_read(
 					  xpon, AIROHA_XGPON_PHY_XG_PHY_STA) &
-	                          AIROHA_XGPON_PHY_PHYA_READY)))
+	                          AIROHA_XGPON_PHY_PHYA_READY))))
 		goto out;
 	if (nla_put_string(
 		    reply, XPON_LINE_XGTC_SYNC,
 		    epon ? "not-applicable" :
+		    gpon ? (xpon->mac_initialized ? "sync" : "hunt") :
 		    !xpon->rx_active ?
 			   "hunt" :
 			   airoha_xgpon_sync_name(FIELD_GET(

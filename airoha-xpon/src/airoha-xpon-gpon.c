@@ -25,6 +25,7 @@
 #include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/iopoll.h>
+#include <linux/regmap.h>
 #include <linux/seq_file.h>
 #include <linux/workqueue.h>
 
@@ -53,6 +54,13 @@
  */
 #define AIROHA_GEPON_PHYSET10  0x124
 #define AIROHA_GEPON_GPON_MODE BIT(31)
+
+/*
+ * SCU 复位控制：厂商 gponDevResetCtrl() 通过 RSTCTRL1[31] 给 PON MAC 做硬复位，
+ * 与 epon.c 的 epon_mac_reset() 用的是同一位（epon.c 里是局部定义，这里不共享头文件）。
+ */
+#define AIROHA_SCU_RSTCTRL1      0x834
+#define AIROHA_SCU_PON_MAC_RESET BIT(31)
 
 /* 计数器表里"本制式没有该计数器"的哨兵；GPON 没有 PLOAMd/PLOAMu 计数器。 */
 #define AIROHA_GPON_COUNTER_NONE 0
@@ -178,6 +186,34 @@ static void airoha_xpon_gpon_stop_mac_interfaces(struct airoha_xpon *xpon,
 			xpon->dev,
 			"timed out stopping GPON MPI (%s), raw=0x%08x\n",
 			reason, value);
+}
+
+/*
+ * P10：按厂商 gponDevResetCtrl(1)/gponDevSwReset/gponDevResetCtrl(0) 的
+ * 完整时序复位 GPON MAC：
+ *   1) SCU RSTCTRL1[31] 脉冲（与 epon.c 的 epon_mac_reset() 同源）；
+ *   2) GPON_MAC_SET bit0 拉低 1us 再拉高；
+ *   3) 释放 MBI/MPI 并清 0x4228/0x422c。
+ * 原实现把 bit0 清 0 当"复位保持"、只在 start_control() 里释放，而它的
+ * 入口挂在 GPON 下恒 0 的 XGS PHY 同步位上，MAC 因此长期停在半复位态。
+ */
+static void airoha_xpon_gpon_hard_reset_mac(struct airoha_xpon *xpon)
+{
+	regmap_set_bits(xpon->scu, AIROHA_SCU_RSTCTRL1,
+	                AIROHA_SCU_PON_MAC_RESET);
+	udelay(1);
+	regmap_clear_bits(xpon->scu, AIROHA_SCU_RSTCTRL1,
+	                  AIROHA_SCU_PON_MAC_RESET);
+
+	airoha_gpon_update_bits(xpon, AIROHA_GPON_MAC_SET,
+	                        AIROHA_GPON_MAC_SET_RELEASED, 0);
+	udelay(1);
+	airoha_gpon_update_bits(xpon, AIROHA_GPON_MAC_SET,
+	                        AIROHA_GPON_MAC_SET_RELEASED,
+	                        AIROHA_GPON_MAC_SET_RELEASED);
+
+	airoha_xpon_gpon_release_mac_interfaces(xpon);
+	airoha_xpon_gpon_clear_errors(xpon, false);
 }
 
 static void airoha_xpon_gpon_program_identity(struct airoha_xpon *xpon)
@@ -460,11 +496,13 @@ int airoha_xpon_gpon_prepare(struct airoha_xpon *xpon)
 		return dev_err_probe(xpon->dev, -ENODEV,
 		                     "GPON MAC window is not mapped\n");
 
-	/* Hold the GPON MAC in reset during PMA initialization. */
+	/*
+	 * 只做接口隔离；MAC 复位统一由 start_rx() 的厂商时序完成（P10）。
+	 * 原来的 "MAC_SET bit0=0 复位保持" 会在 GPON 制式下长期生效，
+	 * 而释放点又挂在 start_control() 上，形成自锁。
+	 */
 	airoha_gpon_write(xpon, AIROHA_GPON_INT_ENABLE, 0);
 	airoha_xpon_gpon_stop_mac_interfaces(xpon, "prepare");
-	airoha_gpon_update_bits(xpon, AIROHA_GPON_MAC_SET,
-	                        AIROHA_GPON_MAC_SET_RELEASED, 0);
 	/*
 	 * MAC 复位不会清 ONU-ID；从上一轮（含 XG-PON）残留的 valid 身份会让
 	 * 第 6 段误判 O2/O4。GPON 只有低 8 bit + bit15 valid，失效值写 0xFF。
@@ -577,6 +615,18 @@ int airoha_xpon_gpon_start_rx(struct airoha_xpon *xpon)
 	xpon->stats.rx_start_count++;
 	xpon->no_sync_since = jiffies;
 
+	/*
+	 * P10：MAC 复位不能等 start_control() 再放——它的入口挂在 GPON 下恒 0
+	 * 的 XGS PHY 同步位上。这里按厂商时序复位后立即释放，并把计数器基线
+	 * 留到 advance_gtc() 判"有没有 GTC 进来"。INT_STATUS 是 W1C，顺手
+	 * 清掉复位期间残留的事件（上一份 bundle 的 0x400 就是没清的旧事件）。
+	 */
+	airoha_xpon_gpon_hard_reset_mac(xpon);
+	airoha_gpon_write(xpon, AIROHA_GPON_INT_ENABLE, 0);
+	airoha_gpon_write(xpon, AIROHA_GPON_INT_STATUS, U32_MAX);
+	xpon->gpon_gtc_last = airoha_gpon_read(xpon, AIROHA_GPON_RX_GTC_CNT);
+	xpon->gpon_sf_last = airoha_gpon_read(xpon, AIROHA_GPON_DS_SF_CNT);
+
 	onu_id = airoha_gpon_read(xpon, AIROHA_GPON_ONU_ID);
 	dev_info(
 		xpon->dev,
@@ -661,10 +711,11 @@ void airoha_xpon_gpon_stop_rx(struct airoha_xpon *xpon)
 	                     rx_ctrl & ~AIROHA_XGPON_PHY_RX_ENABLE);
 	if (xpon->mac_initialized)
 		airoha_xpon_gpon_stop_mac_interfaces(xpon, "rx-deactivate");
-	/* 0x43a0 bit0 清零 = 厂商 gponDevSwReset 的复位保持阶段。 */
-	if (xpon->gpon_base)
-		airoha_gpon_update_bits(xpon, AIROHA_GPON_MAC_SET,
-		                        AIROHA_GPON_MAC_SET_RELEASED, 0);
+	/*
+	 * P10：这里原来把 MAC_SET bit0 清 0 并留着不放，下一次 start_rx 又
+	 * 不解复位，MAC 每轮都停在半复位态。复位统一由 start_rx 的厂商时序
+	 * 完成；停口只做接口隔离。
+	 */
 	airoha_xpon_gpon_clear_assignment(xpon);
 	airoha_xpon_gpon_set_onu_state(xpon, AIROHA_XGPON_O1);
 	xpon->mac_initialized = false;
@@ -693,9 +744,7 @@ void airoha_xpon_gpon_restart_mac(struct airoha_xpon *xpon, const char *reason)
 	synchronize_irq(xpon->mac_irq);
 	if (xpon->mac_initialized)
 		airoha_xpon_gpon_stop_mac_interfaces(xpon, reason);
-	if (xpon->gpon_base)
-		airoha_gpon_update_bits(xpon, AIROHA_GPON_MAC_SET,
-		                        AIROHA_GPON_MAC_SET_RELEASED, 0);
+	/* P10：不做"复位保持"；复位统一由下一次 start_rx 的厂商时序完成。 */
 	airoha_xpon_gpon_clear_assignment(xpon);
 	airoha_xpon_gpon_set_onu_state(xpon, AIROHA_XGPON_O1);
 	xpon->mac_initialized = false;
@@ -778,35 +827,47 @@ static void airoha_xpon_gpon_advance_gtc(struct airoha_xpon *xpon,
 {
 	u32 sync = airoha_pon_phy_read(xpon, AIROHA_XGPON_PHY_DBG_RX_SYNC_ST);
 	u32 sync_state = FIELD_GET(AIROHA_XGPON_PHY_RX_SYNC_MASK, sync);
+	u32 gtc_cnt = airoha_gpon_read(xpon, AIROHA_GPON_RX_GTC_CNT);
+	u32 sf_cnt = airoha_gpon_read(xpon, AIROHA_GPON_DS_SF_CNT);
+	u32 activation = airoha_gpon_read(xpon, AIROHA_GPON_ACTIVATION_ST);
+	bool gtc_moving = gtc_cnt != xpon->gpon_gtc_last ||
+	                  sf_cnt != xpon->gpon_sf_last;
 	int ret;
 
 	/*
-	 * 250ms 轮询每轮都读同步态，逐轮打印会冲掉时间线；同步态只有 2bit，所以按值
-	 * 置位、每个新状态只出一行。GPON 到底会不会离开 hunt 是 P3 的判据，raw 一并
-	 * 留下，便于事后确认这个寄存器在 GPON 下是不是根本不变。
+	 * P10：第 5 段的门控从 XGS PHY 的 DBG_RX_SYNC_ST 改为 MAC 自己的计数
+	 * 证据——RX_GTC_CNT 或 DS_SF_CNT 相对上一轮 250ms 轮询有增量。PHY 那个
+	 * 寄存器在 GPON 制式下 40 轮实测恒 0，不能再当门用，只随 trace 留下。
 	 */
 	if (!(xpon->trace_sync_seen & BIT(sync_state))) {
 		xpon->trace_sync_seen |= BIT(sync_state);
 		airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_GTC, "gtc-sync-state",
-				  "state=%u raw=0x%08x mac_init=%d rx_active=%d physet10=0x%08x gtc_cnt=0x%08x activation=0x%08x\n",
+				  "state=%u raw=0x%08x mac_init=%d rx_active=%d physet10=0x%08x gtc=0x%08x sf=0x%08x activation=0x%08x\n",
 				  sync_state, sync, xpon->mac_initialized,
 				  xpon->rx_active,
 				  airoha_pon_phy_read(xpon, AIROHA_GEPON_PHYSET10),
-				  airoha_gpon_read(xpon, AIROHA_GPON_RX_GTC_CNT),
-				  airoha_gpon_read(xpon, AIROHA_GPON_ACTIVATION_ST));
+				  gtc_cnt, sf_cnt, activation);
 	}
 
-	if (sync_state == AIROHA_XGPON_PHY_RX_SYNC_IN) {
+	xpon->gpon_gtc_last = gtc_cnt;
+	xpon->gpon_sf_last = sf_cnt;
+
+	if (gtc_moving) {
 		xpon->no_sync_since = 0;
 		xpon->stats.no_ready_recovery_count = 0;
 		if (!xpon->mac_initialized) {
+			airoha_xpon_trace(xpon, AIROHA_XPON_TRACE_SEG_GTC,
+					  "gtc-seen",
+					  "gtc=0x%08x sf=0x%08x activation=0x%08x\n",
+					  gtc_cnt, sf_cnt, activation);
 			ret = airoha_xpon_gpon_start_control(xpon);
 			if (ret) {
 				xpon->last_start_error = ret;
 				xpon->lifecycle = AIROHA_XPON_ERROR;
 				airoha_xpon_fail(xpon, AIROHA_XPON_TRACE_SEG_GTC,
 						 "start-control", ret,
-						 "sync_state=%u\n", sync_state);
+						 "gtc=0x%08x sf=0x%08x\n",
+						 gtc_cnt, sf_cnt);
 				*delay = msecs_to_jiffies(
 					AIROHA_XPON_RETRAIN_RETRY_MS);
 				return;
@@ -834,8 +895,8 @@ static void airoha_xpon_gpon_advance_gtc(struct airoha_xpon *xpon,
 		}
 		dev_warn_ratelimited(
 			xpon->dev,
-			"GTC sync lost; resetting MAC epoch while retaining PHY RX\n");
-		airoha_xpon_gpon_restart_mac(xpon, "PHY LOF");
+			"GTC counters stalled; resetting MAC epoch while retaining PHY RX\n");
+		airoha_xpon_gpon_restart_mac(xpon, "GTC counters stalled");
 		*delay = msecs_to_jiffies(AIROHA_XPON_LINK_POLL_MS);
 		return;
 	}

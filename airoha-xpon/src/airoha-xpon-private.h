@@ -271,6 +271,14 @@ struct airoha_xpon {
 	 */
 	u8 trace_sync_seen;
 	/*
+	 * P10：GPON 第 5 段改用 MAC 自己的证据判同步。start_rx 时记下计数器
+	 * 初值，之后每轮与上一轮比较并更新；RX_GTC_CNT/DS_SF_CNT 有增量即
+	 * 认为收到 GTC（激活态只随 trace 打印，不做门控）。PHY 的
+	 * DBG_RX_SYNC_ST 在 GPON 制式下恒 0，同样只留作 trace。
+	 */
+	u32 gpon_gtc_last;
+	u32 gpon_sf_last;
+	/*
 	 * 取证用：上行开通(第7段)被哪几个前置条件挡住，按位累积；只在集合发生
 	 * 变化时出一行，避免 250ms 轮询把 dmesg 冲掉。
 	 */

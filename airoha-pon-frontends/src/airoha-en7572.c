@@ -417,6 +417,30 @@ validate:
 			dev,
 			"BOB A2 calibration area is empty; XG/XGS will use erased/default register codes\n");
 
+	/*
+	 * BOB 取证：GPON 2.5G 与 XG-PON 10G 的 TIA 带宽/增益档不同。
+	 * 把 A2 段（GPON/XG-PON 公共校准区）的关键字段和原始字节打出来，
+	 * 用于判断这张表是按 2.5G 还是 10G 调校的。
+	 */
+	dev_info(dev,
+	         "BOB dump: A0=%s A2=%s imod=0x%04x iav=0x%04x apc=0x%02x tia_cur=0x%02x tia_gain=0x%02x tia_bw=0x%02x pga_gain=0x%02x pga_cap=0x%02x\n",
+	         en->bob_a0_valid ? "valid" : "empty",
+	         en->bob_a2_valid ? "valid" : "empty",
+	         en7572_bob_u16(en, EN7572_BOB_A2_BASE,
+	                        EN7572_BOB_IMOD_CAL),
+	         en7572_bob_u16(en, EN7572_BOB_A2_BASE,
+	                        EN7572_BOB_IAV_CAL),
+	         en7572_bob_u8(en, EN7572_BOB_A2_BASE, EN7572_BOB_APC_CAL),
+	         en7572_bob_u8(en, EN7572_BOB_A2_BASE, EN7572_BOB_TIA_CUR),
+	         en7572_bob_u8(en, EN7572_BOB_A2_BASE,
+	                       EN7572_BOB_TIA_GAIN),
+	         en7572_bob_u8(en, EN7572_BOB_A2_BASE, EN7572_BOB_TIA_BW),
+	         en7572_bob_u8(en, EN7572_BOB_A2_BASE,
+	                       EN7572_BOB_PGA_GAIN),
+	         en7572_bob_u8(en, EN7572_BOB_A2_BASE, EN7572_BOB_PGA_CAP));
+	dev_info(dev, "BOB A2 raw[0x84..0x94]=%17phN\n",
+	         en->bob + EN7572_BOB_A2_BASE + 0x84);
+
 	en7572_apply_tx_ddmi_fallback(dev, en);
 
 	dev_info(dev, "BOB %s: A0=%s A2=%s\n",

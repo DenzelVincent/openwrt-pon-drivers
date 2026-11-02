@@ -320,6 +320,29 @@ static inline void airoha_xgpon_write(struct airoha_xpon *xpon, u32 reg,
 	writel(value, xpon->xgpon_base + reg);
 }
 
+/*
+ * GPON 是独立块（0x1fb64000）。切到 GPON 帧后 xgpon 窗整片读 0xDEADBEEF，
+ * 因此 GPON 路径的每一次 MAC 访问都必须走这组访问器，不能复用 *xgpon_*。
+ */
+static inline u32 airoha_gpon_read(struct airoha_xpon *xpon, u32 reg)
+{
+	return readl(xpon->gpon_base + reg);
+}
+
+static inline void airoha_gpon_write(struct airoha_xpon *xpon, u32 reg,
+                                     u32 value)
+{
+	writel(value, xpon->gpon_base + reg);
+}
+
+static inline void airoha_gpon_update_bits(struct airoha_xpon *xpon, u32 reg,
+                                           u32 mask, u32 value)
+{
+	u32 old_value = airoha_gpon_read(xpon, reg);
+
+	airoha_gpon_write(xpon, reg, (old_value & ~mask) | (value & mask));
+}
+
 static inline u32 airoha_pon_phy_read(struct airoha_xpon *xpon, u32 reg)
 {
 	return readl(xpon->pon_phy_base + reg);

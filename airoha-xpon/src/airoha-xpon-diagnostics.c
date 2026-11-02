@@ -477,9 +477,8 @@ static int pon_pcs_debug_show(struct seq_file *m, void *unused)
 		           airoha_pon_phy_read(
 				   xpon, AIROHA_XGPON_PHY_XG_CONTINUE_CTRL));
 		/*
-		 * The dedicated "gpon" window has no vendor register map, so
-		 * reusing the XG-PON offsets is an assumption; dump both for
-		 * field evidence.
+		 * 偏移表来自 xpon.ko 的命名 CSR（见 GPON 计划 1.9），按名
+		 * 逐条采样两次；不再整片 dump，也不再等 mac_initialized。
 		 */
 		if (airoha_xpon_mode_is_gpon(xpon->active_mode))
 			airoha_xpon_gpon_debug_window(xpon, m);

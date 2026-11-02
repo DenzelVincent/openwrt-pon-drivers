@@ -712,7 +712,7 @@ static int airoha_xpon_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(xpon->epon_base),
 		                     "failed to map EPON MAC registers\n");
 
-	/* Absent on MACs without a dedicated GPON block; only diagnostics use it. */
+	/* Absent on MACs without a dedicated GPON block; GPON mode then fails at prepare. */
 	gpon_res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "gpon");
 	if (gpon_res) {
 		xpon->gpon_window_len = resource_size(gpon_res);

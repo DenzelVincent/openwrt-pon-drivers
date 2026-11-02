@@ -21,6 +21,7 @@
  */
 
 #include <airoha-pon-frontend.h>
+#include <linux/airoha-eth.h>
 #include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/iopoll.h>

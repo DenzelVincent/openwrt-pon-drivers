@@ -409,7 +409,7 @@ static int pon_pcs_debug_show(struct seq_file *m, void *unused)
 {
 	struct airoha_xpon *xpon = m->private;
 	struct airoha_pcs_pon_rx_status status = {};
-	bool available, epon;
+	bool available, epon, gpon;
 
 	mutex_lock(&xpon->state_lock);
 	/* PMA and PCS registers describe the line only when the profile matches. */
@@ -424,6 +424,7 @@ static int pon_pcs_debug_show(struct seq_file *m, void *unused)
 	if (!available)
 		goto out;
 	epon = airoha_xpon_mode_is_epon(xpon->active_mode);
+	gpon = airoha_xpon_mode_is_gpon(xpon->active_mode);
 	if (airoha_pcs_pon_get_rx_status(xpon->pcs, &status))
 		goto out;
 	seq_printf(m,
@@ -464,18 +465,26 @@ static int pon_pcs_debug_show(struct seq_file *m, void *unused)
 			airoha_pon_phy_read(xpon,
 		                            AIROHA_XGPON_PHY_DBG_RX_SYNC_ST));
 
+		/*
+		 * XG_PHY_STA / DBG_RX_SYNC_ST 是 XG-PON PHY 的状态；GPON 下前者
+		 * 恒 0、后者恒 hunt（42 轮实测）。GPON 的"PHY 就绪"改用
+		 * "PCS 有信号且 RX 已开"，GTC 状态用 MAC 是否已进 O2_3 判，
+		 * 避免 LuCI 把正常工作的 GPON PHY 显示成"未就绪"。
+		 */
 		seq_printf(m,
 		           "sfp_status: 0x%08x\n"
 		           "phy_ready: %d\n"
 		           "xgtc_sync: %s\n"
 		           "xg_continue_ctrl: 0x%08x\n",
 		           sfp,
-		           !!(airoha_pon_phy_read(xpon,
-		                                  AIROHA_XGPON_PHY_XG_PHY_STA) &
-		              AIROHA_XGPON_PHY_PHYA_READY),
-		           airoha_xgpon_sync_name(sync),
+		           gpon ? !!(xpon->rx_active && status.signal_detected) :
+		                  !!(airoha_pon_phy_read(
+		                             xpon, AIROHA_XGPON_PHY_XG_PHY_STA) &
+		                     AIROHA_XGPON_PHY_PHYA_READY),
+		           gpon ? (xpon->mac_initialized ? "sync" : "hunt") :
+		                  airoha_xgpon_sync_name(sync),
 		           airoha_pon_phy_read(
-				   xpon, AIROHA_XGPON_PHY_XG_CONTINUE_CTRL));
+		                   xpon, AIROHA_XGPON_PHY_XG_CONTINUE_CTRL));
 		/*
 		 * 偏移表来自 xpon.ko 的命名 CSR（见 GPON 计划 1.9），按名
 		 * 逐条采样两次；不再整片 dump，也不再等 mac_initialized。

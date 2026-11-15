@@ -103,22 +103,32 @@ struct airoha_xpon_epon {
 	unsigned int sync_loss_count;
 	unsigned int recovery_count;
 	unsigned int full_reinit_count;
-	/*
-	 * Set by the MPCP timeout path when a registered MAC stops reaching the
-	 * OLT. link_work consumes it and reloads the optical frontend.
-	 */
-	bool frontend_reset_pending;
-	bool frontend_reset_forced;
-	bool frontend_reload_forced;
 	unsigned int registered_timeout_streak;
 	/*
-	 * Gate re-arms already spent on this wedge. Re-arming is repeated before
-	 * the firmware reload because the reload is the step that can come back
-	 * dark on this hardware.
+	 * Set by the MPCP timeout path when the LLID epoch stops being granted.
+	 * link_work only raises the flag; the reopen worker performs the
+	 * close/open outside state_lock, see airoha_xpon_epon_reopen_begin().
 	 */
-	unsigned int tx_rearm_count;
-	unsigned int frontend_reset_count;
-	unsigned long frontend_reset_after;
+	bool reopen_pending;
+	/*
+	 * The reopen worker closed this line itself and still owes it a
+	 * dev_open(). controller_stop() clears stopping and the active mode, so
+	 * without this flag a retry after a failed open could not tell our own
+	 * closed line apart from one netifd took down.
+	 */
+	bool reopen_holding;
+	/* This reopen also reloads the provider firmware before the next open. */
+	bool reopen_reload;
+	/* Re-opens already spent on the current wedge. */
+	unsigned int reopen_attempts;
+	unsigned int reopen_count;
+	unsigned int reopen_reload_count;
+	/* Earliest time the next reopen may start; owned by the reopen worker. */
+	unsigned long reopen_after;
+	/* When the burst gate started reading not-ready; see AIROHA_XPON_TX_DARK_MS. */
+	unsigned long tx_dark_since;
+	/* Bumped by reset_registration() so log lines tie back to one epoch. */
+	unsigned int registration_epoch;
 	unsigned long registered_since;
 	unsigned long last_registration_lifetime;
 	unsigned int mac_error_count;
@@ -277,6 +287,8 @@ struct airoha_xpon {
 	struct mutex ploam_lock;
 	struct work_struct start_work;
 	struct delayed_work link_work;
+	/* Runs the line close/open that no state_lock holder can perform. */
+	struct delayed_work reopen_work;
 	struct list_head netlink_node;
 	enum airoha_xpon_mode configured_mode;
 	enum airoha_xpon_mode active_mode;
@@ -308,6 +320,8 @@ struct airoha_xpon {
 	bool service_ready;
 	bool stopping;
 	bool active_mode_valid;
+	/* Set once remove() starts so queued recovery cannot resurrect the line. */
+	bool removing;
 };
 
 /*
@@ -316,6 +330,9 @@ struct airoha_xpon {
  * command port. Nested acquisition follows state_lock -> ploam_lock.
  * IRQ publishes events atomically for link_work to consume under state_lock.
  * stopping closes asynchronous entry before IRQ and work synchronization.
+ * The reopen worker is the only context that may run a line close/open, and
+ * it holds no lock the teardown needs; where it does nest, it follows
+ * rtnl_lock -> state_lock, the order ndo_open/ndo_stop already use.
  */
 
 #define AIROHA_XGPON_PLOAMD_MAX_DRAIN    20
@@ -328,6 +345,35 @@ struct airoha_xpon {
  * Every fifth recovery from attempt 2 also resets SCU; others reset PMA.
  */
 #define AIROHA_XPON_FULL_REINIT_PERIOD 5
+/*
+ * A close/open of the line netdev is the only sequence measured to clear a
+ * wedged EPON LLID epoch: it is the one action that runs controller_stop()
+ * outside state_lock, and controller_stop() has to synchronize both IRQs
+ * before it can take that lock. The worker holds the line down for this long
+ * so the optics discharge and the OLT ages out the previous LLID.
+ */
+#define AIROHA_XPON_REOPEN_DISCHARGE_MS 1000
+/* Floor between two cycles, so an unrecoverable line cannot spin the netdev. */
+#define AIROHA_XPON_REOPEN_MIN_MS       5000
+/* Backoff once the wedge survives a cycle: a reopen is disruptive to netifd. */
+#define AIROHA_XPON_REOPEN_RETRY_MS     30000
+/*
+ * Plain cycles that failed to hold. The next reopen also reloads the provider
+ * firmware, which is the step that can bring a wedged EN7572 back dark.
+ */
+#define AIROHA_XPON_REOPEN_RELOAD_AT    3
+/*
+ * A burst gate that never lights cannot be fixed by another Register Request:
+ * on this hardware the analog path only settles after a full frontend
+ * re-prepare, which is what the reopen does. Waiting for three short-lived
+ * registrations to prove that costs about seven seconds of cold start, so ask
+ * for the reopen once the gate has been dark this long.
+ *
+ * Measured here: a gate that does light reports ready 3.7 s after it opened, so
+ * anything still dark at 5 s is a warm-up that failed rather than one still in
+ * progress. Every second beyond that is a second of dead cold start.
+ */
+#define AIROHA_XPON_TX_DARK_MS          5000
 
 static inline u32 airoha_xgpon_read(struct airoha_xpon *xpon, u32 reg)
 {

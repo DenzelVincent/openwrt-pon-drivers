@@ -607,7 +607,9 @@ static int pon_registration_debug_show(struct seq_file *m, void *unused)
 			"sync_losses: %u\n"
 			"recoveries: %u\n"
 			"full_reinitializations: %u\n"
-			"frontend_reloads: %u\n"
+			"registration_epoch: %u\n"
+			"reopens: %u\n"
+			"reopen_reloads: %u\n"
 			"registered_lifetime_ms: %u\n"
 			"last_registration_lifetime_ms: %u\n"
 			"last_register_status: 0x%08x\n",
@@ -621,7 +623,8 @@ static int pon_registration_debug_show(struct seq_file *m, void *unused)
 			xpon->epon.mpcp_timeout_count,
 			xpon->epon.sync_loss_count, xpon->epon.recovery_count,
 			xpon->epon.full_reinit_count,
-			xpon->epon.frontend_reset_count,
+			xpon->epon.registration_epoch, xpon->epon.reopen_count,
+			xpon->epon.reopen_reload_count,
 			xpon->epon.registered_since ?
 				jiffies_to_msecs(jiffies -
 		                                 xpon->epon.registered_since) :
@@ -650,11 +653,12 @@ static int pon_registration_debug_show(struct seq_file *m, void *unused)
 DEFINE_SHOW_ATTRIBUTE(pon_registration_debug);
 
 /*
- * One forced TX-lane recovery, used to exercise the path on a healthy line
- * instead of waiting for a wedge:
+ * Request one line recovery now, instead of waiting for a wedge to raise it:
  *
- *   echo 1 > .../recover_tx   re-arm the burst path (stage 1)
- *   echo 2 > .../recover_tx   reload the frontend firmware (stage 2)
+ *   echo 1 > .../recover_tx   close and re-open the line
+ *   echo 2 > .../recover_tx   the same, plus an optical firmware reload
+ *
+ * The worker runs the cycle asynchronously, so this only queues it.
  */
 static ssize_t pon_recover_tx_write(struct file *file,
                                     const char __user *user_buf, size_t count,
@@ -669,14 +673,21 @@ static ssize_t pon_recover_tx_write(struct file *file,
 		return -EFAULT;
 	input[count] = '\0';
 
-	if (input[0] == '2')
-		WRITE_ONCE(xpon->epon.frontend_reload_forced, true);
-	else if (input[0] == '1' || input[0] == 'y' || input[0] == 'Y')
-		WRITE_ONCE(xpon->epon.frontend_reset_forced, true);
-	else
+	mutex_lock(&xpon->state_lock);
+	if (input[0] == '2') {
+		xpon->epon.reopen_reload = true;
+		xpon->epon.reopen_pending = true;
+	} else if (input[0] == '1' || input[0] == 'y' || input[0] == 'Y') {
+		xpon->epon.reopen_pending = true;
+	} else {
+		mutex_unlock(&xpon->state_lock);
 		return -EINVAL;
+	}
+	/* A manual request ignores the cooldown left by the last attempt. */
+	xpon->epon.reopen_after = 0;
+	mutex_unlock(&xpon->state_lock);
 
-	mod_delayed_work(system_wq, &xpon->link_work, 0);
+	schedule_delayed_work(&xpon->reopen_work, 0);
 	return count;
 }
 

@@ -146,6 +146,8 @@ struct en7572 {
 	struct delayed_work ready_work;
 	unsigned long gate_opened;
 	bool tx_ready_state;
+	/* Consecutive samples that read SYS_TX_READY; see en7572_ready_work(). */
+	unsigned int ready_confirm;
 };
 
 static u8 en7572_bob_u8(struct en7572 *en, unsigned int base,
@@ -683,6 +685,15 @@ static bool en7572_tx_ready(struct en7572 *en)
 #define EN7572_READY_POLL_MS        20
 #define EN7572_READY_POLL_WINDOW_MS 8000
 #define EN7572_READY_POLL_IDLE_MS   1000
+/*
+ * One sample is not evidence. On this hardware SYS_TX_READY came up 3.9 s after
+ * the gate opened and was already clear again at the 4 s capture, while the
+ * laser was still dark (TX power ADC read 0x0001 instead of 0x466e). The MAC
+ * answered Gates in that window and every registration it won died one second
+ * later. Require the latch to hold across a run longer than that false window,
+ * which costs about 140 ms once the analog path really does settle.
+ */
+#define EN7572_READY_CONFIRM        8
 
 static bool en7572_tx_ready_cached(struct airoha_pon_frontend *frontend)
 {
@@ -692,15 +703,26 @@ static bool en7572_tx_ready_cached(struct airoha_pon_frontend *frontend)
 }
 
 /*
+ * Every gate transition restarts the run: a count left over from the previous
+ * burst would let the first sample of the next one publish ready on its own.
+ */
+static void en7572_clear_ready(struct en7572 *en)
+{
+	en->ready_confirm = 0;
+	WRITE_ONCE(en->tx_ready_state, false);
+}
+
+/*
  * Warm lines report ready within a few hundred milliseconds of the gate
- * opening, cold ones need more than a second. Poll fast while the answer is
- * still no so the MAC can answer the first capable Discovery Gate, then fall
- * back to a slow poll that keeps the cached flag honest.
+ * opening, cold ones need more than a second. Poll fast until the answer
+ * settles, so the MAC answers the first Discovery Gate that really is backed
+ * by light, then fall back to a slow poll that keeps the cached flag honest.
  */
 static void en7572_ready_work(struct work_struct *work)
 {
 	struct en7572 *en = container_of(to_delayed_work(work), struct en7572,
 	                                 ready_work);
+	bool hw_ready;
 	bool ready;
 	unsigned int delay;
 	u32 sys = 0;
@@ -715,7 +737,13 @@ static void en7572_ready_work(struct work_struct *work)
 		return;
 	}
 
-	ready = !!(sys & EN7572_SYS_TX_READY);
+	hw_ready = !!(sys & EN7572_SYS_TX_READY);
+	if (!hw_ready)
+		en->ready_confirm = 0;
+	else if (en->ready_confirm < EN7572_READY_CONFIRM)
+		en->ready_confirm++;
+
+	ready = en->ready_confirm >= EN7572_READY_CONFIRM;
 	if (ready != READ_ONCE(en->tx_ready_state)) {
 		WRITE_ONCE(en->tx_ready_state, ready);
 		if (ready)
@@ -724,8 +752,16 @@ static void en7572_ready_work(struct work_struct *work)
 			         jiffies_to_msecs(jiffies - en->gate_opened));
 	}
 
+	/*
+	 * Keep the fast poll while the answer has not settled, so the run of
+	 * confirmations costs milliseconds instead of full idle periods. A line
+	 * that already settled drops back to the slow poll that keeps the cached
+	 * flag honest.
+	 */
 	if (ready)
 		delay = EN7572_READY_POLL_IDLE_MS;
+	else if (hw_ready)
+		delay = EN7572_READY_POLL_MS;
 	else if (time_after(jiffies, en->gate_opened +
 	                                 msecs_to_jiffies(
 	                                         EN7572_READY_POLL_WINDOW_MS)))
@@ -926,7 +962,7 @@ static int en7572_prepare(struct airoha_pon_frontend *frontend,
 	mutex_lock(&en->lock);
 	en->prepared = false;
 	en->tx_gate_enabled = false;
-	WRITE_ONCE(en->tx_ready_state, false);
+	en7572_clear_ready(en);
 	cancel_delayed_work(&en->ready_work);
 
 	ret = en7572_update_bits(en, EN7572_BEN_CTRL, EN7572_BEN_MODE_MASK,
@@ -1138,7 +1174,7 @@ static int en7572_set_tx_enable(struct airoha_pon_frontend *frontend,
 			en->tx_gate_enabled = true;
 			/* A fresh gate starts dark until the analog path reports in. */
 			en->gate_opened = jiffies;
-			WRITE_ONCE(en->tx_ready_state, false);
+			en7572_clear_ready(en);
 			mod_delayed_work(system_wq, &en->ready_work, 0);
 			/* Sample the burst path while it is supposed to be alive. */
 			en->sample_shot = 0;
@@ -1151,7 +1187,7 @@ static int en7572_set_tx_enable(struct airoha_pon_frontend *frontend,
 		if (en->tx_disable)
 			gpiod_set_value_cansleep(en->tx_disable, 1);
 		en->tx_gate_enabled = false;
-		WRITE_ONCE(en->tx_ready_state, false);
+		en7572_clear_ready(en);
 		cancel_delayed_work(&en->ready_work);
 		ret = en7572_update_bits(en, EN7572_BEN_CTRL,
 		                         EN7572_BEN_MODE_MASK,
@@ -1173,7 +1209,7 @@ static int en7572_unprepare(struct airoha_pon_frontend *frontend)
 		gpiod_set_value_cansleep(en->tx_disable, 1);
 	en->tx_gate_enabled = false;
 	en->prepared = false;
-	WRITE_ONCE(en->tx_ready_state, false);
+	en7572_clear_ready(en);
 	cancel_delayed_work(&en->ready_work);
 	ret = en7572_update_bits(en, EN7572_BEN_CTRL, EN7572_BEN_MODE_MASK,
 	                         EN7572_BEN_MODE_OFF);
@@ -1200,7 +1236,7 @@ static int en7572_reset(struct airoha_pon_frontend *frontend)
 	mutex_lock(&en->lock);
 	en->prepared = false;
 	en->tx_gate_enabled = false;
-	WRITE_ONCE(en->tx_ready_state, false);
+	en7572_clear_ready(en);
 	cancel_delayed_work(&en->ready_work);
 	if (en->tx_disable)
 		gpiod_set_value_cansleep(en->tx_disable, 1);

@@ -150,6 +150,10 @@ void airoha_xpon_oam_set_link(struct airoha_xpon_oam *oam, bool ready, u16 llid,
 		context |= AIROHA_OAM_CTX_READY;
 	WRITE_ONCE(oam->tx_context, context);
 
+	/* The OAM channel follows the LLID epoch; log every transition. */
+	netdev_dbg(oam->netdev, "%s: llid=0x%04x channel=%u context=0x%08x\n",
+		   ready ? "ready" : "not ready", llid, channel, context);
+
 	if (!ready) {
 		netif_carrier_off(oam->netdev);
 		netif_tx_disable(oam->netdev);

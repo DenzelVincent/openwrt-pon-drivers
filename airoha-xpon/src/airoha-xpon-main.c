@@ -3,6 +3,7 @@
 #include <airoha-pon-frontend.h>
 #include <linux/airoha-eth.h>
 #include <linux/atomic.h>
+#include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -26,6 +27,16 @@
 #include "airoha-xpon-omci.h"
 #include "airoha-xpon-xgpon.h"
 
+/*
+ * Closing and opening the line is disruptive to netifd and its upper
+ * interfaces, so it is switchable: a deployment that watches the line itself
+ * can turn the automatic cycle off and keep the debugfs trigger.
+ */
+static bool auto_reopen = true;
+module_param_named(auto_reopen, auto_reopen, bool, 0644);
+MODULE_PARM_DESC(auto_reopen,
+		 "Close and re-open the PON line when an EPON LLID epoch wedges");
+
 void airoha_xpon_set_data_path_link(struct airoha_xpon *xpon, bool ready)
 {
 	/*
@@ -33,6 +44,9 @@ void airoha_xpon_set_data_path_link(struct airoha_xpon *xpon, bool ready)
 	 * queue readiness together after GEM/T-CONT or LLID/channel metadata is
 	 * installed, so VLAN upper devices observe a complete path.
 	 */
+	dev_dbg(xpon->dev, "%s carrier %s (epoch=%u state=%u)\n",
+		xpon->pon_netdev->name, ready ? "on" : "off",
+		xpon->epon.registration_epoch, xpon->epon.mpcp_state);
 	if (ready) {
 		netif_carrier_on(xpon->pon_netdev);
 		netif_tx_wake_all_queues(xpon->pon_netdev);
@@ -156,6 +170,8 @@ static void airoha_xpon_start_work(struct work_struct *work)
 		goto out_unlock;
 
 	xpon->last_start_error = 0;
+	dev_dbg(xpon->dev, "PON line start: mode=%s lifecycle=%u\n",
+		airoha_xpon_mode_name(xpon->active_mode), xpon->lifecycle);
 	ret = airoha_xpon_prepare_frontend_locked(xpon);
 	if (ret) {
 		xpon->last_start_error = ret;
@@ -174,6 +190,9 @@ static void airoha_xpon_start_work(struct work_struct *work)
 			        ret);
 		} else if (!xpon->stopping) {
 			start_monitor = true;
+			dev_dbg(xpon->dev,
+				"PON line start complete: lifecycle=%u rx_active=%u\n",
+				xpon->lifecycle, xpon->rx_active);
 		}
 	}
 
@@ -194,6 +213,9 @@ static int airoha_xpon_controller_start(void *priv)
 	 */
 	mutex_lock(&xpon->state_lock);
 	if (xpon->lifecycle != AIROHA_XPON_STOPPED) {
+		dev_dbg(xpon->dev,
+			"PON line open refused: lifecycle=%u is not stopped\n",
+			xpon->lifecycle);
 		ret = -EBUSY;
 		goto out_unlock;
 	}
@@ -205,9 +227,16 @@ static int airoha_xpon_controller_start(void *priv)
 		xpon->last_start_error = ret;
 		goto out_unlock;
 	}
+	dev_dbg(xpon->dev, "PON line open: mode=%s\n", mode->name);
 	xpon->stopping = false;
 	xpon->active_mode = xpon->configured_mode;
 	xpon->active_mode_valid = true;
+	/*
+	 * The line is up again whoever asked for it, so any queued recovery is
+	 * satisfied and the reopen worker no longer owes this line an open.
+	 */
+	xpon->epon.reopen_pending = false;
+	xpon->epon.reopen_holding = false;
 	xpon->identity.active_identity = xpon->identity.pending_identity;
 	xpon->last_start_error = 0;
 	atomic_set(&xpon->phy_events, 0);
@@ -231,6 +260,17 @@ static void airoha_xpon_controller_stop(void *priv)
 	struct airoha_xpon *xpon = priv;
 	bool epon = READ_ONCE(xpon->active_mode_valid) &&
 	            airoha_xpon_mode_is_epon(READ_ONCE(xpon->active_mode));
+
+	/*
+	 * Both IRQ synchronizations below need the handlers to be able to run, and
+	 * the threaded handler takes state_lock first. Nothing may call this with
+	 * state_lock already held, which is exactly why the recovery path in
+	 * link_work cannot do it and has to hand the close/open to the reopen
+	 * worker.
+	 */
+	dev_dbg(xpon->dev,
+		"PON line stop: lifecycle=%u rx_active=%u mac_initialized=%u epon=%u\n",
+		xpon->lifecycle, xpon->rx_active, xpon->mac_initialized, epon);
 
 	/* The stopping gate closes asynchronous entry and upstream bursts. */
 	WRITE_ONCE(xpon->stopping, true);
@@ -278,6 +318,7 @@ static void airoha_xpon_controller_stop(void *priv)
 	xpon->lifecycle = AIROHA_XPON_STOPPED;
 	xpon->active_mode_valid = false;
 	airoha_xpon_leds_update(xpon);
+	dev_dbg(xpon->dev, "PON line stopped: lifecycle=%u\n", xpon->lifecycle);
 	mutex_unlock(&xpon->state_lock);
 }
 
@@ -407,14 +448,151 @@ static void airoha_xpon_advance_rx_locked(struct airoha_xpon *xpon,
 	}
 }
 
+/*
+ * Clear a wedged EPON LLID epoch by closing and opening the line, which is what
+ * "ip link set <dev> down; sleep 1; up" does by hand and the only recovery
+ * measured to work on this hardware.
+ *
+ * This cannot happen in link_work: controller_stop() calls synchronize_irq()
+ * before it takes state_lock, while the threaded IRQ handler owns state_lock
+ * first, so a caller that already holds the lock would deadlock. This worker
+ * therefore owns no lock the teardown needs, which makes it the only legal
+ * place for the cycle. It also reproduces the userspace sequence exactly,
+ * including the port teardown that airoha_eth does around ndo_stop/ndo_open.
+ *
+ * Between dev_close() and dev_open() the line is down and controller_stop() has
+ * cleared stopping and the active mode, so reopen_holding is the only thing that
+ * distinguishes our own closed line from one netifd took down. It also keeps the
+ * retry path alive after a failed open, which link_work can no longer drive
+ * because it exits as soon as stopping is set.
+ */
+static void airoha_xpon_reopen_work(struct work_struct *work)
+{
+	struct airoha_xpon *xpon = container_of(to_delayed_work(work),
+	                                        struct airoha_xpon, reopen_work);
+	struct net_device *netdev = xpon->pon_netdev;
+	unsigned int attempt;
+	bool reload;
+	bool held;
+	int ret;
+
+	/* rtnl_lock() is the outer lock of ndo_open/ndo_stop; take it first. */
+	rtnl_lock();
+	if (READ_ONCE(xpon->removing)) {
+		rtnl_unlock();
+		return;
+	}
+
+	mutex_lock(&xpon->state_lock);
+	held = xpon->epon.reopen_holding;
+	mutex_unlock(&xpon->state_lock);
+
+	/*
+	 * Down and not held means netifd wants the line down; overriding that is
+	 * not the driver's business. Down and held is the retry path: the line is
+	 * closed because this worker closed it and still owes it an open.
+	 */
+	if (!netif_running(netdev) && !held) {
+		mutex_lock(&xpon->state_lock);
+		xpon->epon.reopen_pending = false;
+		mutex_unlock(&xpon->state_lock);
+		dev_dbg(xpon->dev,
+			"EPON line re-open skipped: %s is administratively down\n",
+			netdev->name);
+		rtnl_unlock();
+		return;
+	}
+
+	if (netif_running(netdev) && held) {
+		/*
+		 * netifd opened the line this worker had closed. The epoch is
+		 * already fresh, so closing it again would only add a flap.
+		 */
+		mutex_lock(&xpon->state_lock);
+		xpon->epon.reopen_pending = false;
+		airoha_xpon_epon_reopen_end(xpon, false, 0);
+		attempt = xpon->epon.reopen_attempts;
+		mutex_unlock(&xpon->state_lock);
+		dev_dbg(xpon->dev,
+			"EPON line re-open attempt %u: %s is already up again\n",
+			attempt, netdev->name);
+		rtnl_unlock();
+		return;
+	}
+
+	mutex_lock(&xpon->state_lock);
+	ret = airoha_xpon_epon_reopen_begin(xpon) ? 0 : -EALREADY;
+	reload = xpon->epon.reopen_reload;
+	attempt = xpon->epon.reopen_attempts;
+	mutex_unlock(&xpon->state_lock);
+
+	if (ret) {
+		/* Taken down, mode cleared or already recovered while queued. */
+		rtnl_unlock();
+		return;
+	}
+
+	if (netif_running(netdev)) {
+		dev_warn(xpon->dev,
+			 "EPON line wedged: closing %s to restart the LLID epoch (attempt %u)\n",
+			 netdev->name, attempt);
+		dev_close(netdev);
+	} else {
+		/* Retry: the line stayed closed from the previous attempt. */
+		dev_warn(xpon->dev,
+			 "EPON line re-open attempt %u: opening %s again\n",
+			 attempt, netdev->name);
+	}
+	rtnl_unlock();
+
+	/* Let the optics discharge and the OLT age out the previous LLID. */
+	msleep(AIROHA_XPON_REOPEN_DISCHARGE_MS);
+
+	if (reload) {
+		/*
+		 * Plain cycles did not hold, so also reload the provider firmware.
+		 * The line is down here, which is the only state in which the
+		 * provider can be reset without racing controller_start().
+		 */
+		dev_warn(xpon->dev,
+			 "EPON line re-open attempt %u: reloading the optical frontend firmware\n",
+			 attempt);
+		ret = airoha_pon_frontend_reset(xpon->frontend);
+		if (ret == -EOPNOTSUPP)
+			dev_dbg(xpon->dev,
+				"optical frontend cannot reload firmware; continuing with the line re-open only\n");
+		else if (ret)
+			dev_warn(xpon->dev,
+				 "optical frontend reload failed: %d; opening the line anyway\n",
+				 ret);
+		/* Only a reload that actually ran counts as one. */
+		reload = !ret;
+	}
+
+	rtnl_lock();
+	if (READ_ONCE(xpon->removing)) {
+		/* Removal owns the line now; leave it closed and stay silent. */
+		rtnl_unlock();
+		return;
+	}
+	/* No extack: this open is driver-initiated, not a netlink request. */
+	ret = dev_open(netdev, NULL);
+	rtnl_unlock();
+
+	mutex_lock(&xpon->state_lock);
+	airoha_xpon_epon_reopen_end(xpon, reload, ret);
+	mutex_unlock(&xpon->state_lock);
+}
+
 static void airoha_xpon_link_work(struct work_struct *work)
 {
 	struct airoha_xpon *xpon = container_of(to_delayed_work(work),
 	                                        struct airoha_xpon, link_work);
 	struct airoha_pon_frontend_signal_status optical = {};
 	unsigned long delay = msecs_to_jiffies(AIROHA_XPON_LINK_POLL_MS);
+	unsigned long reopen_delay = 0;
 	u32 phy_events = atomic_xchg(&xpon->phy_events, 0);
-	bool requeue;
+	bool requeue, reopen = false;
 	int ret;
 
 	/* Provider sampling may sleep and runs outside state_lock. */
@@ -445,13 +623,40 @@ static void airoha_xpon_link_work(struct work_struct *work)
 	airoha_xpon_leds_update(xpon);
 
 	/*
-	 * An armed EPON MAC that keeps missing grants has a wedged burst path:
-	 * the optics answers on I2C while the fibre carries no light. Reloading
-	 * the provider firmware from link_work restarts the line itself.
+	 * A gate that stays dark cannot be fixed by another Register Request: the
+	 * analog path only settles after a full frontend re-prepare, which is what
+	 * the reopen does. Ask for it directly rather than waiting for three
+	 * short-lived registrations to prove the same thing.
 	 */
-	if (airoha_xpon_mode_is_epon(xpon->active_mode) &&
-	    airoha_xpon_epon_recover_tx(xpon))
-		goto out_requeue;
+	if (airoha_xpon_mode_is_epon(xpon->active_mode) && xpon->optical_signal &&
+	    xpon->tx_armed && READ_ONCE(auto_reopen)) {
+		if (airoha_pon_frontend_tx_ready(xpon->frontend)) {
+			xpon->epon.tx_dark_since = 0;
+		} else if (!xpon->epon.tx_dark_since) {
+			xpon->epon.tx_dark_since = jiffies;
+		} else if (time_after(jiffies, xpon->epon.tx_dark_since +
+		                               msecs_to_jiffies(
+		                                       AIROHA_XPON_TX_DARK_MS))) {
+			dev_warn(xpon->dev,
+			         "EPON burst gate dark for %u ms; restarting the LLID epoch\n",
+			         AIROHA_XPON_TX_DARK_MS);
+			xpon->epon.reopen_pending = true;
+			xpon->epon.tx_dark_since = 0;
+		}
+	} else {
+		xpon->epon.tx_dark_since = 0;
+	}
+
+	/*
+	 * A wedged LLID epoch is only cleared by a real close/open of the line,
+	 * which cannot run under state_lock. Ask the reopen worker for one and
+	 * keep monitoring: the reopen restarts the epoch this loop follows.
+	 * A dark line is left to the LOS handling below, which has nothing to do
+	 * with the reference clock the OLT stopped granting.
+	 */
+	if (airoha_xpon_mode_is_epon(xpon->active_mode) && xpon->optical_signal &&
+	    READ_ONCE(auto_reopen))
+		reopen = airoha_xpon_epon_request_reopen(xpon, &reopen_delay);
 
 	/* IRQ queues Deactivate; link_work commits the plain MAC reset under state_lock. */
 	if (!airoha_xpon_mode_is_epon(xpon->active_mode)) {
@@ -473,6 +678,12 @@ out_requeue:
 	mutex_unlock(&xpon->state_lock);
 	if (requeue)
 		schedule_delayed_work(&xpon->link_work, delay);
+	/*
+	 * Scheduling outside state_lock keeps the worker from blocking on the lock
+	 * this function still holds; a delay above zero is the reopen backoff.
+	 */
+	if (reopen)
+		schedule_delayed_work(&xpon->reopen_work, reopen_delay);
 	return;
 
 out_no_requeue:
@@ -593,6 +804,7 @@ static int airoha_xpon_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&xpon->netlink_node);
 	INIT_WORK(&xpon->start_work, airoha_xpon_start_work);
 	INIT_DELAYED_WORK(&xpon->link_work, airoha_xpon_link_work);
+	INIT_DELAYED_WORK(&xpon->reopen_work, airoha_xpon_reopen_work);
 	atomic_set(&xpon->phy_events, 0);
 	atomic_set(&xpon->mac_restart_pending, 0);
 	atomic_set(&xpon->tx_resync_pending, 0);
@@ -746,9 +958,20 @@ static void airoha_xpon_remove(struct platform_device *pdev)
 {
 	struct airoha_xpon *xpon = platform_get_drvdata(pdev);
 
-	/* Stop drains work and closes BEN before devm releases IRQ/MMIO. */
+	/* Drop the user-facing triggers first so nothing new can be queued. */
 	airoha_xpon_debugfs_remove(xpon);
 	airoha_xpon_netlink_unregister(xpon);
+
+	/*
+	 * Drain the reopen worker before the controller and netdev go away, and
+	 * flag it first so a cycle that is already past its checks stays down
+	 * instead of re-opening a line that is being removed. This runs without
+	 * rtnl, so the worker can always finish its own rtnl_lock() section.
+	 */
+	WRITE_ONCE(xpon->removing, true);
+	cancel_delayed_work_sync(&xpon->reopen_work);
+
+	/* Stop drains work and closes BEN before devm releases IRQ/MMIO. */
 	airoha_eth_pon_unregister_controller(xpon->pon_netdev, xpon);
 	airoha_xpon_controller_stop(xpon);
 }

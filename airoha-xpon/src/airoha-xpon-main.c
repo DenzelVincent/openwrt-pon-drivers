@@ -214,6 +214,9 @@ static int airoha_xpon_controller_start(void *priv)
 	atomic_set(&xpon->mac_restart_pending, 0);
 	atomic_set(&xpon->tx_resync_pending, 0);
 	atomic_set(&xpon->data_path_retry_pending, 0);
+	atomic_set(&xpon->mbi_reset_pending, 0);
+	xpon->mbi_overrun_streak = 0;
+	xpon->mbi_reset_jiffies = jiffies;
 	atomic_set(&xpon->epon.pending_events, 0);
 	atomic_set(&xpon->epon.pending_error_events, 0);
 out_unlock:
@@ -237,6 +240,7 @@ static void airoha_xpon_controller_stop(void *priv)
 	atomic_set(&xpon->mac_restart_pending, 0);
 	atomic_set(&xpon->tx_resync_pending, 0);
 	atomic_set(&xpon->data_path_retry_pending, 0);
+	atomic_set(&xpon->mbi_reset_pending, 0);
 	if (epon) {
 		WRITE_ONCE(xpon->tx_armed, false);
 		airoha_pon_frontend_set_tx_enable(xpon->frontend, false);
@@ -455,6 +459,9 @@ static void airoha_xpon_link_work(struct work_struct *work)
 
 	/* IRQ queues Deactivate; link_work commits the plain MAC reset under state_lock. */
 	if (!airoha_xpon_mode_is_epon(xpon->active_mode)) {
+		if (atomic_xchg(&xpon->mbi_reset_pending, 0))
+			airoha_xpon_xgpon_restart_mac(xpon,
+			                              "MBI RX overrun storm");
 		if (atomic_xchg(&xpon->mac_restart_pending, 0))
 			airoha_xpon_xgpon_restart_mac(xpon, "OLT Deactivate");
 		if (atomic_xchg(&xpon->data_path_retry_pending, 0))
@@ -597,6 +604,7 @@ static int airoha_xpon_probe(struct platform_device *pdev)
 	atomic_set(&xpon->mac_restart_pending, 0);
 	atomic_set(&xpon->tx_resync_pending, 0);
 	atomic_set(&xpon->data_path_retry_pending, 0);
+	atomic_set(&xpon->mbi_reset_pending, 0);
 	atomic_set(&xpon->epon.discovery_gate_count, 0);
 	atomic_set(&xpon->epon.register_request_count, 0);
 	xpon->lifecycle = AIROHA_XPON_STOPPED;

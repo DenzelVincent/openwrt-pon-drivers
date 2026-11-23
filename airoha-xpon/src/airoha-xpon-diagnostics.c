@@ -499,13 +499,21 @@ static int pon_mac_debug_show(struct seq_file *m, void *unused)
 		           "fifo_error: 0x%08x\n"
 		           "tx_error: 0x%08x\n"
 		           "rx_error: 0x%08x\n"
-		           "mbi_mpi_stop: 0x%08x\n",
+		           "mbi_mpi_stop: 0x%08x\n"
+		           "bwm_check: 0x%08x\n"
+		           "mbi_header_overrun_irq: %u\n"
+		           "mbi_payload_overrun_irq: %u\n"
+		           "mbi_reset: %u\n",
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_INT_STATUS),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_INT_ENABLE),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_FIFO_ERR_STS),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_TX_ERR_STS),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_RX_ERR_STS),
-		           airoha_xgpon_read(xpon, AIROHA_XGPON_MBI_MPI_STOP));
+		           airoha_xgpon_read(xpon, AIROHA_XGPON_MBI_MPI_STOP),
+		           airoha_xgpon_read(xpon, AIROHA_XGPON_DBG_BWM_CHK_STS),
+		           xpon->stats.rx_mbi_header_overrun_irq_count,
+		           xpon->stats.rx_mbi_payload_overrun_irq_count,
+		           xpon->stats.mbi_reset_count);
 	}
 out:
 	mutex_unlock(&xpon->state_lock);

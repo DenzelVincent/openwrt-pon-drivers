@@ -184,6 +184,7 @@ struct airoha_xpon_stats {
 	unsigned int mac_error_irq_count;
 	unsigned int rx_mbi_header_overrun_irq_count;
 	unsigned int rx_mbi_payload_overrun_irq_count;
+	unsigned int mbi_reset_count;
 	unsigned int tx_late_error_count;
 	unsigned int tx_resync_count;
 	unsigned int tx_resync_failure_count;
@@ -292,6 +293,10 @@ struct airoha_xpon {
 	atomic_t tx_resync_pending;
 	/* Assign_Alloc-ID queues deferred data paths for link_work. */
 	atomic_t data_path_retry_pending;
+	/* An RX MBI overrun storm queues a MAC epoch reset for link_work. */
+	unsigned int mbi_overrun_streak;
+	unsigned long mbi_reset_jiffies;
+	atomic_t mbi_reset_pending;
 	enum airoha_xgpon_onu_state onu_state;
 	u16 onu_id;
 	u32 eqd;
@@ -328,6 +333,17 @@ struct airoha_xpon {
  * Every fifth recovery from attempt 2 also resets SCU; others reset PMA.
  */
 #define AIROHA_XPON_FULL_REINIT_PERIOD 5
+
+/*
+ * A few downstream MBI RX overruns are tolerated: they just drop frames. A
+ * dense storm means the MBI block itself wedged, which software cannot clear
+ * because the block refuses to go quiescent (MBI_RX/TX_STOP_DONE never
+ * assert). Only a MAC epoch reset recovers it, and the rest of the link then
+ * rebuilds itself: the O5 activation path re-arms upstream and userspace
+ * re-publishes the data paths. The rate limit bounds reset flapping.
+ */
+#define AIROHA_XPON_MBI_RESET_THRESHOLD 32
+#define AIROHA_XPON_MBI_RESET_MIN_MS    60000
 
 static inline u32 airoha_xgpon_read(struct airoha_xpon *xpon, u32 reg)
 {

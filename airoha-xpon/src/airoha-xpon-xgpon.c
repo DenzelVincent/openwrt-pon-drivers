@@ -292,6 +292,27 @@ irqreturn_t airoha_xpon_xgpon_irq(struct airoha_xpon *xpon)
 			xpon->stats.rx_mbi_header_overrun_irq_count++;
 		if (fifo_error & AIROHA_XGPON_FIFO_ERR_RX_MBI_PAYLOAD_OVERRUN)
 			xpon->stats.rx_mbi_payload_overrun_irq_count++;
+		/*
+		 * A few overruns just drop frames. A dense storm means the MBI
+		 * block wedged and will never drain again, so queue a MAC epoch
+		 * reset from link_work. Rate limited to bound reset flapping.
+		 */
+		if (fifo_error & (AIROHA_XGPON_FIFO_ERR_RX_MBI_HEADER_OVERRUN |
+		                  AIROHA_XGPON_FIFO_ERR_RX_MBI_PAYLOAD_OVERRUN)) {
+			unsigned long reset_at;
+
+			xpon->mbi_overrun_streak++;
+			reset_at = xpon->mbi_reset_jiffies +
+			           msecs_to_jiffies(AIROHA_XPON_MBI_RESET_MIN_MS);
+			if (xpon->mbi_overrun_streak >=
+			            AIROHA_XPON_MBI_RESET_THRESHOLD &&
+			    time_after(jiffies, reset_at)) {
+				xpon->mbi_overrun_streak = 0;
+				xpon->mbi_reset_jiffies = jiffies;
+				xpon->stats.mbi_reset_count++;
+				atomic_set(&xpon->mbi_reset_pending, 1);
+			}
+		}
 
 		airoha_xgpon_write(xpon, AIROHA_XGPON_FIFO_ERR_STS, U32_MAX);
 		airoha_xgpon_write(xpon, AIROHA_XGPON_TX_ERR_STS, U32_MAX);
@@ -317,7 +338,8 @@ irqreturn_t airoha_xpon_xgpon_irq(struct airoha_xpon *xpon)
 			xpon->dev,
 			"PLOAMd FIFO drain reached the per-IRQ safety limit\n");
 	if (atomic_read(&xpon->mac_restart_pending) ||
-	    atomic_read(&xpon->data_path_retry_pending))
+	    atomic_read(&xpon->data_path_retry_pending) ||
+	    atomic_read(&xpon->mbi_reset_pending))
 		mod_delayed_work(system_wq, &xpon->link_work, 0);
 
 	return IRQ_HANDLED;

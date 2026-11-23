@@ -192,6 +192,17 @@ struct airoha_xpon_stats {
 	u32 latched_tx_error;
 	u32 latched_rx_error;
 	u32 latched_bwm_check;
+	/* start_rx() clears the latches; keep the previous epoch's mask. */
+	u32 last_epoch_latched_fifo_error;
+	u32 last_epoch_latched_bwm_check;
+	/* First RX MBI overrun of the current MAC epoch, kept for debugfs. */
+	u64 mbi_first_fault_uptime_ms;
+	u32 mbi_first_fault_fifo_error;
+	u32 mbi_first_fault_xgem_rx;
+	u32 mbi_first_fault_phy_sync;
+	u32 mbi_first_fault_ploamd_fifo;
+	u32 mbi_first_fault_mbi_stop;
+	bool mbi_first_fault_seen;
 	unsigned int ploamd_accepted;
 	unsigned int ploamd_rejected;
 	unsigned int ploamu_blocked;
@@ -297,6 +308,17 @@ struct airoha_xpon {
 	unsigned int mbi_overrun_streak;
 	unsigned long mbi_reset_jiffies;
 	atomic_t mbi_reset_pending;
+	/*
+	 * Slow sampling of the MAC intake and the GDM handoff, so the next wedge
+	 * can be attributed to one segment. Diagnostic only; no recovery action.
+	 */
+	unsigned long mbi_sample_jiffies;
+	unsigned long mbi_xgem_change_jiffies;
+	unsigned long mbi_delivered_change_jiffies;
+	u32 mbi_xgem_last;
+	u64 mbi_delivered_last;
+	bool mbi_xgem_valid;
+	bool mbi_delivered_valid;
 	enum airoha_xgpon_onu_state onu_state;
 	u16 onu_id;
 	u32 eqd;
@@ -344,6 +366,9 @@ struct airoha_xpon {
  */
 #define AIROHA_XPON_MBI_RESET_THRESHOLD 32
 #define AIROHA_XPON_MBI_RESET_MIN_MS    60000
+
+/* Wedge sampling rides the 250 ms link poll. */
+#define AIROHA_XPON_MBI_SAMPLE_MS 5000
 
 static inline u32 airoha_xgpon_read(struct airoha_xpon *xpon, u32 reg)
 {

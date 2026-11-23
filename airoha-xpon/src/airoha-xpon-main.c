@@ -4,6 +4,7 @@
 #include <linux/airoha-eth.h>
 #include <linux/atomic.h>
 #include <linux/interrupt.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
@@ -411,6 +412,69 @@ static void airoha_xpon_advance_rx_locked(struct airoha_xpon *xpon,
 	}
 }
 
+static u32 airoha_xpon_mbi_idle_ms(unsigned long since)
+{
+	return since ? jiffies_to_msecs(jiffies - since) : 0;
+}
+
+/*
+ * Track when the MAC intake (XGEM RX counter) and the GDM handoff (delivered
+ * packets) last moved. A wedge stops one or both, which separates a stuck MAC
+ * from a stalled MBI/GDM drain without touching recovery.
+ */
+static void airoha_xpon_mbi_sample_locked(struct airoha_xpon *xpon)
+{
+	struct airoha_pon_datapath_stats stats = {};
+	bool active;
+	u32 xgem_rx;
+
+	if (time_before(jiffies, xpon->mbi_sample_jiffies))
+		return;
+	xpon->mbi_sample_jiffies =
+		jiffies + msecs_to_jiffies(AIROHA_XPON_MBI_SAMPLE_MS);
+
+	active = xpon->mac_initialized && xpon->rx_active &&
+	         xpon->onu_state == AIROHA_XGPON_O5;
+	if (!active) {
+		xpon->mbi_xgem_valid = false;
+		xpon->mbi_delivered_valid = false;
+		xpon->mbi_xgem_change_jiffies = 0;
+		xpon->mbi_delivered_change_jiffies = 0;
+		return;
+	}
+
+	xgem_rx = airoha_xgpon_read(xpon, AIROHA_XGPON_RX_XGEM_CNT);
+	if (!xpon->mbi_xgem_valid || xgem_rx != xpon->mbi_xgem_last) {
+		xpon->mbi_xgem_last = xgem_rx;
+		xpon->mbi_xgem_valid = true;
+		xpon->mbi_xgem_change_jiffies = jiffies;
+	}
+
+	if (airoha_eth_pon_get_datapath_stats(xpon->pon_netdev, &stats))
+		return;
+	if (!xpon->mbi_delivered_valid ||
+	    stats.rx_packets_delivered != xpon->mbi_delivered_last) {
+		xpon->mbi_delivered_last = stats.rx_packets_delivered;
+		xpon->mbi_delivered_valid = true;
+		xpon->mbi_delivered_change_jiffies = jiffies;
+	}
+}
+
+static void airoha_xpon_mbi_wedge_report_locked(struct airoha_xpon *xpon)
+{
+	struct airoha_pon_datapath_stats stats = {};
+	int ret;
+
+	ret = airoha_eth_pon_get_datapath_stats(xpon->pon_netdev, &stats);
+	dev_warn(xpon->dev,
+	         "MBI RX overrun storm: XGEM RX changed %u ms ago, GDM RX delivered changed %u ms ago (xgem_rx=%u delivered=%llu dropped=%llu)\n",
+	         airoha_xpon_mbi_idle_ms(xpon->mbi_xgem_change_jiffies),
+	         airoha_xpon_mbi_idle_ms(xpon->mbi_delivered_change_jiffies),
+	         airoha_xgpon_read(xpon, AIROHA_XGPON_RX_XGEM_CNT),
+	         ret ? 0 : stats.rx_packets_delivered,
+	         ret ? 0 : stats.rx_descriptors_dropped);
+}
+
 static void airoha_xpon_link_work(struct work_struct *work)
 {
 	struct airoha_xpon *xpon = container_of(to_delayed_work(work),
@@ -462,9 +526,12 @@ static void airoha_xpon_link_work(struct work_struct *work)
 
 	/* IRQ queues Deactivate; link_work commits the plain MAC reset under state_lock. */
 	if (!airoha_xpon_mode_is_epon(xpon->active_mode)) {
-		if (atomic_xchg(&xpon->mbi_reset_pending, 0))
+		airoha_xpon_mbi_sample_locked(xpon);
+		if (atomic_xchg(&xpon->mbi_reset_pending, 0)) {
+			airoha_xpon_mbi_wedge_report_locked(xpon);
 			airoha_xpon_xgpon_restart_mac(xpon,
 			                              "MBI RX overrun storm");
+		}
 		if (atomic_xchg(&xpon->mac_restart_pending, 0))
 			airoha_xpon_xgpon_restart_mac(xpon, "OLT Deactivate");
 		if (atomic_xchg(&xpon->data_path_retry_pending, 0))

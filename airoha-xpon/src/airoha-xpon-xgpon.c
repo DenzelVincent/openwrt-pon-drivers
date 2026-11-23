@@ -4,6 +4,7 @@
 #include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/iopoll.h>
+#include <linux/jiffies.h>
 #include <linux/workqueue.h>
 
 #include "airoha-xpon-private.h"
@@ -258,6 +259,34 @@ void airoha_xpon_xgpon_drain_ploamd_locked(struct airoha_xpon *xpon)
 			"PLOAMd FIFO drain reached the per-IRQ safety limit\n");
 }
 
+static void airoha_xpon_xgpon_log_first_mbi_overrun(struct airoha_xpon *xpon,
+                                                    u32 events, u32 fifo_error,
+                                                    u32 tx_error, u32 rx_error,
+                                                    u32 bwm_check)
+{
+	/* Snapshot the segments around MBI RX before the W1C clear hides them. */
+	u32 phy_sync = airoha_pon_phy_read(xpon,
+	                                   AIROHA_XGPON_PHY_DBG_RX_SYNC_ST);
+	u32 ploamd_fifo = airoha_xgpon_read(xpon,
+	                                    AIROHA_XGPON_PLOAMD_FIFO_STS);
+	u32 xgem_rx = airoha_xgpon_read(xpon, AIROHA_XGPON_RX_XGEM_CNT);
+	u32 mbi_stop = airoha_xgpon_read(xpon, AIROHA_XGPON_MBI_MPI_STOP);
+	u64 uptime_ms = (u64)jiffies_to_msecs(jiffies);
+
+	xpon->stats.mbi_first_fault_uptime_ms = uptime_ms;
+	xpon->stats.mbi_first_fault_fifo_error = fifo_error;
+	xpon->stats.mbi_first_fault_xgem_rx = xgem_rx;
+	xpon->stats.mbi_first_fault_phy_sync = phy_sync;
+	xpon->stats.mbi_first_fault_ploamd_fifo = ploamd_fifo;
+	xpon->stats.mbi_first_fault_mbi_stop = mbi_stop;
+	WRITE_ONCE(xpon->stats.mbi_first_fault_seen, true);
+
+	dev_warn(xpon->dev,
+	         "first RX MBI overrun this epoch: uptime=%llu ms events=0x%08x fifo=0x%08x tx=0x%08x rx=0x%08x bwm=0x%08x phy_sync=0x%08x ploamd_fifo=0x%08x xgem_rx=%u mbi_stop=0x%08x\n",
+	         (unsigned long long)uptime_ms, events, fifo_error, tx_error,
+	         rx_error, bwm_check, phy_sync, ploamd_fifo, xgem_rx, mbi_stop);
+}
+
 irqreturn_t airoha_xpon_xgpon_irq(struct airoha_xpon *xpon)
 {
 	u32 enabled, events, status;
@@ -319,6 +348,10 @@ irqreturn_t airoha_xpon_xgpon_irq(struct airoha_xpon *xpon)
 		                  AIROHA_XGPON_FIFO_ERR_RX_MBI_PAYLOAD_OVERRUN)) {
 			unsigned long reset_at;
 
+			if (!READ_ONCE(xpon->stats.mbi_first_fault_seen))
+				airoha_xpon_xgpon_log_first_mbi_overrun(
+					xpon, events, fifo_error, tx_error,
+					rx_error, bwm_check);
 			xpon->mbi_overrun_streak++;
 			reset_at = xpon->mbi_reset_jiffies +
 			           msecs_to_jiffies(AIROHA_XPON_MBI_RESET_MIN_MS);
@@ -501,6 +534,10 @@ static int airoha_xpon_xgpon_start_control(struct airoha_xpon *xpon)
 	/* Clear bootloader state before enabling activation interrupts. */
 	airoha_xpon_drain_ploamd(xpon);
 	airoha_xpon_clear_mac_errors(xpon, true);
+	/* A new MAC epoch re-arms the one-shot wedge snapshot. */
+	xpon->stats.mbi_first_fault_seen = false;
+	xpon->mbi_xgem_valid = false;
+	xpon->mbi_delivered_valid = false;
 	airoha_xgpon_write(xpon, AIROHA_XGPON_INT_STATUS,
 	                   AIROHA_XGPON_INT_ACTIVATION_MASK |
 	                           AIROHA_XGPON_INT_ERROR_MASK);
@@ -678,6 +715,11 @@ void airoha_xpon_xgpon_stop_rx(struct airoha_xpon *xpon)
 void airoha_xpon_xgpon_restart_mac(struct airoha_xpon *xpon, const char *reason)
 {
 	airoha_xpon_xgpon_counters_update(xpon);
+	/* start_rx() clears the software latch; keep this epoch's mask. */
+	xpon->stats.last_epoch_latched_fifo_error =
+		xpon->stats.latched_fifo_error;
+	xpon->stats.last_epoch_latched_bwm_check =
+		xpon->stats.latched_bwm_check;
 	atomic_set(&xpon->tx_resync_pending, 0);
 	airoha_xgpon_write(xpon, AIROHA_XGPON_INT_ENABLE, 0);
 	xpon->xgpon_irq_enabled = false;

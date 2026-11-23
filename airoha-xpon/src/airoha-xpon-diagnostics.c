@@ -493,6 +493,13 @@ static int pon_mac_debug_show(struct seq_file *m, void *unused)
 	if (epon) {
 		airoha_xpon_epon_debug_mac(xpon, m);
 	} else {
+		u32 xgem_idle = xpon->mbi_xgem_change_jiffies ?
+			jiffies_to_msecs(jiffies -
+			                 xpon->mbi_xgem_change_jiffies) : 0;
+		u32 delivered_idle = xpon->mbi_delivered_change_jiffies ?
+			jiffies_to_msecs(jiffies -
+			                 xpon->mbi_delivered_change_jiffies) : 0;
+
 		seq_printf(m,
 		           "interrupt_status: 0x%08x\n"
 		           "interrupt_enable: 0x%08x\n"
@@ -503,7 +510,18 @@ static int pon_mac_debug_show(struct seq_file *m, void *unused)
 		           "bwm_check: 0x%08x\n"
 		           "mbi_header_overrun_irq: %u\n"
 		           "mbi_payload_overrun_irq: %u\n"
-		           "mbi_reset: %u\n",
+		           "mbi_reset: %u\n"
+		           "xgem_rx_idle_ms: %u\n"
+		           "rx_delivered_idle_ms: %u\n"
+		           "mbi_first_fault_seen: %d\n"
+		           "mbi_first_fault_uptime_ms: %llu\n"
+		           "mbi_first_fault_fifo_error: 0x%08x\n"
+		           "mbi_first_fault_xgem_rx: %u\n"
+		           "mbi_first_fault_phy_sync: 0x%08x\n"
+		           "mbi_first_fault_ploamd_fifo: 0x%08x\n"
+		           "mbi_first_fault_mbi_stop: 0x%08x\n"
+		           "latched_fifo_error_prev: 0x%08x\n"
+		           "latched_bwm_check_prev: 0x%08x\n",
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_INT_STATUS),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_INT_ENABLE),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_FIFO_ERR_STS),
@@ -513,7 +531,17 @@ static int pon_mac_debug_show(struct seq_file *m, void *unused)
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_DBG_BWM_CHK_STS),
 		           xpon->stats.rx_mbi_header_overrun_irq_count,
 		           xpon->stats.rx_mbi_payload_overrun_irq_count,
-		           xpon->stats.mbi_reset_count);
+		           xpon->stats.mbi_reset_count,
+		           xgem_idle, delivered_idle,
+		           xpon->stats.mbi_first_fault_seen,
+		           (unsigned long long)xpon->stats.mbi_first_fault_uptime_ms,
+		           xpon->stats.mbi_first_fault_fifo_error,
+		           xpon->stats.mbi_first_fault_xgem_rx,
+		           xpon->stats.mbi_first_fault_phy_sync,
+		           xpon->stats.mbi_first_fault_ploamd_fifo,
+		           xpon->stats.mbi_first_fault_mbi_stop,
+		           xpon->stats.last_epoch_latched_fifo_error,
+		           xpon->stats.last_epoch_latched_bwm_check);
 	}
 out:
 	mutex_unlock(&xpon->state_lock);

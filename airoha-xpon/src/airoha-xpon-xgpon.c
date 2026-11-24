@@ -272,6 +272,21 @@ static void airoha_xpon_xgpon_log_first_mbi_overrun(struct airoha_xpon *xpon,
 	u32 xgem_rx = airoha_xgpon_read(xpon, AIROHA_XGPON_RX_XGEM_CNT);
 	u32 mbi_stop = airoha_xgpon_read(xpon, AIROHA_XGPON_MBI_MPI_STOP);
 	u64 uptime_ms = (u64)jiffies_to_msecs(jiffies);
+	u32 trace_count = min_t(u32, xpon->mbi_trace_count,
+	                        AIROHA_XPON_MBI_TRACE_LEN);
+	u32 i;
+
+	/*
+	 * Freeze the rolling trace in chronological order. The epoch reset that
+	 * follows would otherwise drop these samples before debugfs is read.
+	 */
+	xpon->mbi_fault_trace_count = trace_count;
+	for (i = 0; i < trace_count; i++) {
+		u32 index = (xpon->mbi_trace_head + AIROHA_XPON_MBI_TRACE_LEN -
+		             trace_count + i) % AIROHA_XPON_MBI_TRACE_LEN;
+
+		xpon->mbi_fault_trace[i] = xpon->mbi_trace[index];
+	}
 
 	xpon->stats.mbi_first_fault_uptime_ms = uptime_ms;
 	xpon->stats.mbi_first_fault_fifo_error = fifo_error;
@@ -282,9 +297,59 @@ static void airoha_xpon_xgpon_log_first_mbi_overrun(struct airoha_xpon *xpon,
 	WRITE_ONCE(xpon->stats.mbi_first_fault_seen, true);
 
 	dev_warn(xpon->dev,
-	         "first RX MBI overrun this epoch: uptime=%llu ms events=0x%08x fifo=0x%08x tx=0x%08x rx=0x%08x bwm=0x%08x phy_sync=0x%08x ploamd_fifo=0x%08x xgem_rx=%u mbi_stop=0x%08x\n",
+	         "first RX MBI overrun this epoch: uptime=%llu ms events=0x%08x fifo=0x%08x tx=0x%08x rx=0x%08x bwm=0x%08x phy_sync=0x%08x ploamd_fifo=0x%08x xgem_rx=%u mbi_stop=0x%08x bwm_first_ms=%llu rx_err_first_ms=%llu\n",
 	         (unsigned long long)uptime_ms, events, fifo_error, tx_error,
-	         rx_error, bwm_check, phy_sync, ploamd_fifo, xgem_rx, mbi_stop);
+	         rx_error, bwm_check, phy_sync, ploamd_fifo, xgem_rx, mbi_stop,
+	         (unsigned long long)xpon->stats.latched_bwm_check_first_ms,
+	         (unsigned long long)xpon->stats.latched_rx_error_first_ms);
+
+	if (!trace_count)
+		return;
+
+	/* The oldest sample anchors deltas that show which segment stopped. */
+	{
+		u64 delivered_delta = 0, dropped_delta = 0;
+
+		if (xpon->mbi_fault_trace[0].delivered_valid &&
+		    xpon->mbi_fault_trace[trace_count - 1].delivered_valid) {
+			delivered_delta =
+				xpon->mbi_fault_trace[trace_count - 1].delivered -
+				xpon->mbi_fault_trace[0].delivered;
+			dropped_delta =
+				xpon->mbi_fault_trace[trace_count - 1].dropped -
+				xpon->mbi_fault_trace[0].dropped;
+		}
+		dev_warn(xpon->dev,
+		         "MBI pre-fault trace: %u samples over %u ms; xgem +%u xgtc +%u ploamd +%u delivered +%llu dropped +%llu\n",
+		         trace_count,
+		         jiffies_to_msecs(jiffies -
+		                          xpon->mbi_fault_trace[0].jiffies),
+		         xgem_rx - xpon->mbi_fault_trace[0].xgem_rx,
+		         airoha_xgpon_read(xpon, AIROHA_XGPON_RX_XGTC_CNT) -
+			         xpon->mbi_fault_trace[0].xgtc_rx,
+		         airoha_xgpon_read(xpon, AIROHA_XGPON_RX_PLOAMD_CNT) -
+			         xpon->mbi_fault_trace[0].ploamd_rx,
+		         (unsigned long long)delivered_delta,
+		         (unsigned long long)dropped_delta);
+	}
+
+	/* Every other 250 ms sample keeps each line readable in syslog. */
+	for (i = 0; i < trace_count; i += 2)
+		dev_warn(xpon->dev,
+		         "  MBI trace t-%u ms: xgem=%u xgtc=%u ploamd=%u delivered=%llu dropped=%llu bwm=0x%08x rx_error=0x%08x\n",
+		         jiffies_to_msecs(jiffies -
+		                          xpon->mbi_fault_trace[i].jiffies),
+		         xpon->mbi_fault_trace[i].xgem_rx,
+		         xpon->mbi_fault_trace[i].xgtc_rx,
+		         xpon->mbi_fault_trace[i].ploamd_rx,
+		         (unsigned long long)(xpon->mbi_fault_trace[i]
+				  .delivered_valid ?
+				  xpon->mbi_fault_trace[i].delivered : 0),
+		         (unsigned long long)(xpon->mbi_fault_trace[i]
+				  .delivered_valid ?
+				  xpon->mbi_fault_trace[i].dropped : 0),
+		         xpon->mbi_fault_trace[i].bwm_check,
+		         xpon->mbi_fault_trace[i].rx_error);
 }
 
 irqreturn_t airoha_xpon_xgpon_irq(struct airoha_xpon *xpon)
@@ -536,6 +601,8 @@ static int airoha_xpon_xgpon_start_control(struct airoha_xpon *xpon)
 	airoha_xpon_clear_mac_errors(xpon, true);
 	/* A new MAC epoch re-arms the one-shot wedge snapshot. */
 	xpon->stats.mbi_first_fault_seen = false;
+	xpon->stats.latched_bwm_check_first_ms = 0;
+	xpon->stats.latched_rx_error_first_ms = 0;
 	xpon->mbi_xgem_valid = false;
 	xpon->mbi_delivered_valid = false;
 	airoha_xgpon_write(xpon, AIROHA_XGPON_INT_STATUS,
@@ -720,6 +787,10 @@ void airoha_xpon_xgpon_restart_mac(struct airoha_xpon *xpon, const char *reason)
 		xpon->stats.latched_fifo_error;
 	xpon->stats.last_epoch_latched_bwm_check =
 		xpon->stats.latched_bwm_check;
+	xpon->stats.last_epoch_latched_bwm_check_first_ms =
+		xpon->stats.latched_bwm_check_first_ms;
+	xpon->stats.last_epoch_latched_rx_error_first_ms =
+		xpon->stats.latched_rx_error_first_ms;
 	atomic_set(&xpon->tx_resync_pending, 0);
 	airoha_xgpon_write(xpon, AIROHA_XGPON_INT_ENABLE, 0);
 	xpon->xgpon_irq_enabled = false;

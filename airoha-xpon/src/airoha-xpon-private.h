@@ -195,6 +195,15 @@ struct airoha_xpon_stats {
 	/* start_rx() clears the latches; keep the previous epoch's mask. */
 	u32 last_epoch_latched_fifo_error;
 	u32 last_epoch_latched_bwm_check;
+	/*
+	 * First sampler tick that observed bwm_check/rx_error asserted. Those
+	 * latches outlive the health of the link, so only the onset time can
+	 * relate them to a wedge.
+	 */
+	u64 latched_bwm_check_first_ms;
+	u64 latched_rx_error_first_ms;
+	u64 last_epoch_latched_bwm_check_first_ms;
+	u64 last_epoch_latched_rx_error_first_ms;
 	/* First RX MBI overrun of the current MAC epoch, kept for debugfs. */
 	u64 mbi_first_fault_uptime_ms;
 	u32 mbi_first_fault_fifo_error;
@@ -266,6 +275,18 @@ struct airoha_xpon_data_path_state {
 	bool configured;
 };
 
+struct airoha_xpon_mbi_trace_sample {
+	unsigned long jiffies;
+	u32 xgem_rx;
+	u32 xgtc_rx;
+	u32 ploamd_rx;
+	u64 delivered;
+	u64 dropped;
+	u32 bwm_check;
+	u32 rx_error;
+	bool delivered_valid;
+};
+
 struct airoha_xpon {
 	struct device *dev;
 	struct dentry *debug_dir;
@@ -319,6 +340,16 @@ struct airoha_xpon {
 	u64 mbi_delivered_last;
 	bool mbi_xgem_valid;
 	bool mbi_delivered_valid;
+	/*
+	 * 250 ms rolling window of MAC intake, XGTC/PLOAMD arrival and GDM
+	 * handoff. The first overrun copies it aside so debugfs survives the
+	 * epoch reset that follows the storm.
+	 */
+	struct airoha_xpon_mbi_trace_sample mbi_trace[AIROHA_XPON_MBI_TRACE_LEN];
+	struct airoha_xpon_mbi_trace_sample mbi_fault_trace[AIROHA_XPON_MBI_TRACE_LEN];
+	u32 mbi_trace_head;
+	u32 mbi_trace_count;
+	u32 mbi_fault_trace_count;
 	enum airoha_xgpon_onu_state onu_state;
 	u16 onu_id;
 	u32 eqd;
@@ -368,7 +399,9 @@ struct airoha_xpon {
 #define AIROHA_XPON_MBI_RESET_MIN_MS    60000
 
 /* Wedge sampling rides the 250 ms link poll. */
-#define AIROHA_XPON_MBI_SAMPLE_MS 5000
+#define AIROHA_XPON_MBI_SAMPLE_MS 250
+/* Rolling 4 s intake/handoff history copied aside on the first overrun. */
+#define AIROHA_XPON_MBI_TRACE_LEN 16
 
 static inline u32 airoha_xgpon_read(struct airoha_xpon *xpon, u32 reg)
 {

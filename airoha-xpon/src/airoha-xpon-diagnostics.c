@@ -499,6 +499,7 @@ static int pon_mac_debug_show(struct seq_file *m, void *unused)
 		u32 delivered_idle = xpon->mbi_delivered_change_jiffies ?
 			jiffies_to_msecs(jiffies -
 			                 xpon->mbi_delivered_change_jiffies) : 0;
+		u32 i;
 
 		seq_printf(m,
 		           "interrupt_status: 0x%08x\n"
@@ -508,6 +509,9 @@ static int pon_mac_debug_show(struct seq_file *m, void *unused)
 		           "rx_error: 0x%08x\n"
 		           "mbi_mpi_stop: 0x%08x\n"
 		           "bwm_check: 0x%08x\n"
+		           "rx_xgem_cnt: %u\n"
+		           "rx_xgtc_cnt: %u\n"
+		           "rx_ploamd_cnt: %u\n"
 		           "mbi_header_overrun_irq: %u\n"
 		           "mbi_payload_overrun_irq: %u\n"
 		           "mbi_reset: %u\n"
@@ -520,8 +524,14 @@ static int pon_mac_debug_show(struct seq_file *m, void *unused)
 		           "mbi_first_fault_phy_sync: 0x%08x\n"
 		           "mbi_first_fault_ploamd_fifo: 0x%08x\n"
 		           "mbi_first_fault_mbi_stop: 0x%08x\n"
+		           "bwm_first_ms: %llu\n"
+		           "rx_err_first_ms: %llu\n"
+		           "bwm_first_ms_prev: %llu\n"
+		           "rx_err_first_ms_prev: %llu\n"
 		           "latched_fifo_error_prev: 0x%08x\n"
-		           "latched_bwm_check_prev: 0x%08x\n",
+		           "latched_bwm_check_prev: 0x%08x\n"
+		           "mbi_trace_count: %u\n"
+		           "mbi_fault_trace_count: %u\n",
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_INT_STATUS),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_INT_ENABLE),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_FIFO_ERR_STS),
@@ -529,6 +539,9 @@ static int pon_mac_debug_show(struct seq_file *m, void *unused)
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_RX_ERR_STS),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_MBI_MPI_STOP),
 		           airoha_xgpon_read(xpon, AIROHA_XGPON_DBG_BWM_CHK_STS),
+		           airoha_xgpon_read(xpon, AIROHA_XGPON_RX_XGEM_CNT),
+		           airoha_xgpon_read(xpon, AIROHA_XGPON_RX_XGTC_CNT),
+		           airoha_xgpon_read(xpon, AIROHA_XGPON_RX_PLOAMD_CNT),
 		           xpon->stats.rx_mbi_header_overrun_irq_count,
 		           xpon->stats.rx_mbi_payload_overrun_irq_count,
 		           xpon->stats.mbi_reset_count,
@@ -540,8 +553,34 @@ static int pon_mac_debug_show(struct seq_file *m, void *unused)
 		           xpon->stats.mbi_first_fault_phy_sync,
 		           xpon->stats.mbi_first_fault_ploamd_fifo,
 		           xpon->stats.mbi_first_fault_mbi_stop,
+		           (unsigned long long)
+				   xpon->stats.latched_bwm_check_first_ms,
+		           (unsigned long long)
+				   xpon->stats.latched_rx_error_first_ms,
+		           (unsigned long long)
+				   xpon->stats.last_epoch_latched_bwm_check_first_ms,
+		           (unsigned long long)
+				   xpon->stats.last_epoch_latched_rx_error_first_ms,
 		           xpon->stats.last_epoch_latched_fifo_error,
-		           xpon->stats.last_epoch_latched_bwm_check);
+		           xpon->stats.last_epoch_latched_bwm_check,
+		           xpon->mbi_trace_count,
+		           xpon->mbi_fault_trace_count);
+
+		for (i = 0; i < xpon->mbi_fault_trace_count; i++) {
+			const struct airoha_xpon_mbi_trace_sample *sample =
+				&xpon->mbi_fault_trace[i];
+
+			seq_printf(m,
+			           "mbi_fault_trace[%u]: at_ms=%u xgem=%u xgtc=%u ploamd=%u delivered=%llu dropped=%llu bwm=0x%08x rx_error=0x%08x\n",
+			           i, jiffies_to_msecs(sample->jiffies),
+			           sample->xgem_rx, sample->xgtc_rx,
+			           sample->ploamd_rx,
+			           (unsigned long long)(sample->delivered_valid ?
+				                    sample->delivered : 0),
+			           (unsigned long long)(sample->delivered_valid ?
+				                    sample->dropped : 0),
+			           sample->bwm_check, sample->rx_error);
+		}
 	}
 out:
 	mutex_unlock(&xpon->state_lock);

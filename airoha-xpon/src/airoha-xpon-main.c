@@ -418,6 +418,44 @@ static u32 airoha_xpon_mbi_idle_ms(unsigned long since)
 }
 
 /*
+ * Record one point of the intake/handoff trace. bwm_check and rx_error are
+ * hardware latches without an interrupt source, so only sampling can date
+ * them; treat the first nonzero observation as their onset.
+ */
+static void airoha_xpon_mbi_trace_push_locked(
+	struct airoha_xpon *xpon, u32 xgem_rx,
+	const struct airoha_pon_datapath_stats *stats, bool stats_valid)
+{
+	struct airoha_xpon_mbi_trace_sample *sample;
+	u32 bwm_check, rx_error;
+
+	bwm_check = airoha_xgpon_read(xpon, AIROHA_XGPON_DBG_BWM_CHK_STS);
+	rx_error = airoha_xgpon_read(xpon, AIROHA_XGPON_RX_ERR_STS);
+
+	sample = &xpon->mbi_trace[xpon->mbi_trace_head];
+	sample->jiffies = jiffies;
+	sample->xgem_rx = xgem_rx;
+	sample->xgtc_rx = airoha_xgpon_read(xpon, AIROHA_XGPON_RX_XGTC_CNT);
+	sample->ploamd_rx = airoha_xgpon_read(xpon, AIROHA_XGPON_RX_PLOAMD_CNT);
+	sample->delivered = stats_valid ? stats->rx_packets_delivered : 0;
+	sample->dropped = stats_valid ? stats->rx_descriptors_dropped : 0;
+	sample->bwm_check = bwm_check;
+	sample->rx_error = rx_error;
+	sample->delivered_valid = stats_valid;
+	xpon->mbi_trace_head = (xpon->mbi_trace_head + 1) %
+	                       AIROHA_XPON_MBI_TRACE_LEN;
+	if (xpon->mbi_trace_count < AIROHA_XPON_MBI_TRACE_LEN)
+		xpon->mbi_trace_count++;
+
+	if (bwm_check && !xpon->stats.latched_bwm_check_first_ms)
+		xpon->stats.latched_bwm_check_first_ms =
+			jiffies_to_msecs(jiffies);
+	if (rx_error && !xpon->stats.latched_rx_error_first_ms)
+		xpon->stats.latched_rx_error_first_ms =
+			jiffies_to_msecs(jiffies);
+}
+
+/*
  * Track when the MAC intake (XGEM RX counter) and the GDM handoff (delivered
  * packets) last moved. A wedge stops one or both, which separates a stuck MAC
  * from a stalled MBI/GDM drain without touching recovery.
@@ -427,6 +465,7 @@ static void airoha_xpon_mbi_sample_locked(struct airoha_xpon *xpon)
 	struct airoha_pon_datapath_stats stats = {};
 	bool active;
 	u32 xgem_rx;
+	int ret;
 
 	if (time_before(jiffies, xpon->mbi_sample_jiffies))
 		return;
@@ -440,6 +479,9 @@ static void airoha_xpon_mbi_sample_locked(struct airoha_xpon *xpon)
 		xpon->mbi_delivered_valid = false;
 		xpon->mbi_xgem_change_jiffies = 0;
 		xpon->mbi_delivered_change_jiffies = 0;
+		/* Do not carry stale samples into the next activation's window. */
+		xpon->mbi_trace_head = 0;
+		xpon->mbi_trace_count = 0;
 		return;
 	}
 
@@ -450,14 +492,15 @@ static void airoha_xpon_mbi_sample_locked(struct airoha_xpon *xpon)
 		xpon->mbi_xgem_change_jiffies = jiffies;
 	}
 
-	if (airoha_eth_pon_get_datapath_stats(xpon->pon_netdev, &stats))
-		return;
-	if (!xpon->mbi_delivered_valid ||
-	    stats.rx_packets_delivered != xpon->mbi_delivered_last) {
+	ret = airoha_eth_pon_get_datapath_stats(xpon->pon_netdev, &stats);
+	if (!ret &&
+	    (!xpon->mbi_delivered_valid ||
+	     stats.rx_packets_delivered != xpon->mbi_delivered_last)) {
 		xpon->mbi_delivered_last = stats.rx_packets_delivered;
 		xpon->mbi_delivered_valid = true;
 		xpon->mbi_delivered_change_jiffies = jiffies;
 	}
+	airoha_xpon_mbi_trace_push_locked(xpon, xgem_rx, &stats, !ret);
 }
 
 static void airoha_xpon_mbi_wedge_report_locked(struct airoha_xpon *xpon)

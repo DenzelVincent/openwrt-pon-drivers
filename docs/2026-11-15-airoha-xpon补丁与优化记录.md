@@ -7,17 +7,17 @@
 记录规范：
 
 - 本分支只记录相对上游的优化；chore/文档整理合并成一行。
-- 状态只写已核实的事实：`已推送`/`未推送`、`已上机`/`未上机`、`已验收`/`待验收`。
+- 不记录推送状态；只写已核实的事实：`已上机`/`未上机`、`已验收`/`待验收`。
 
 ## 一、相对上游
 
 | 项 | 提交 | 状态 | 验收要点 |
 |---|---|---|---|
-| XG-PON MBI RX 溢出风暴自愈（移植上游 #49） | `3929816` | 已推送；已上机长跑中 | 连续 32 次 overrun 且距上次复位 ≥60 s 才复位 MAC epoch；PHY RX 保留，ONU 回 O1，O5 重建约 17 s；正常时 overrun 应恒 0 |
-| PLOAMd IRQ 锁反转 + AES 切换超时传播（移植上游 #1） | `5898477` | 已推送；已上机 | PLOAMd 事件不丢不挂；AES key switch 失败能上报 |
-| MBI RX 卡死现场与分段诊断（纯观测） | `ea612e5` | 已推送；11-24 已上机 | 不改阈值与复位路径；首故障快照与 idle 采样见第二节 |
-| MBI 250ms 预故障环形观测（纯观测） | `04f2b21` | 未推送；未上机 | 采样 5 s→250 ms，保留 16 点≈4 s；首个 overrun 冻结 `mbi_fault_trace` 并在 dmesg 打增量+逐点；`bwm_check`/`rx_error` 记首次非零时间；mac dump 增实时 XGEM/XGTC/PLOAMD |
-| 忽略 IDE 与 tmp、忽略文件补末尾换行 | `1971bd6`、`bd82f7a` | 已推送 | 仅仓库整理，不进固件 |
+| XG-PON MBI RX 溢出风暴自愈（移植上游 #49） | `3929816` | 已上机长跑中 | 连续 32 次 overrun 且距上次复位 ≥60 s 才复位 MAC epoch；PHY RX 保留，ONU 回 O1，O5 重建约 17 s；正常时 overrun 应恒 0 |
+| PLOAMd IRQ 锁反转 + AES 切换超时传播（移植上游 #1） | `5898477` | 已上机 | PLOAMd 事件不丢不挂；AES key switch 失败能上报 |
+| MBI RX 卡死现场与分段诊断（纯观测） | `ea612e5` | 11-24 已上机 | 不改阈值与复位路径；首故障快照与 idle 采样见第二节 |
+| MBI 250ms 预故障环形观测（纯观测） | `04f2b21` | 未上机 | 采样 5 s→250 ms，保留 16 点≈4 s；首个 overrun 冻结 `mbi_fault_trace` 并在 dmesg 打增量+逐点；`bwm_check`/`rx_error` 记首次非零时间；mac dump 增实时 XGEM/XGTC/PLOAMD |
+| 忽略 IDE 与 tmp、忽略文件补末尾换行 | `1971bd6`、`bd82f7a` | — | 仅仓库整理，不进固件 |
 
 ## 二、MBI RX 卡死观测（`ea612e5` + `04f2b21`）
 
@@ -62,7 +62,7 @@ cat /sys/kernel/debug/airoha-xpon-pon0/mac
 
 `mbi_first_fault_*` 在新 MAC epoch 开始时清零，因此要么在首次 overrun 后、复位前抓，要么只看复位后仍保留的 `*_prev` 与 dmesg 留痕。`idle_ms` 是“距最后一次变化”的时长，只在 O5 稳态下才有判读意义。
 
-提交号、推送与合入状态只看本仓库 git 和本文表格，日志里没有。
+提交号与合入状态只看本仓库 git 和本文表格，日志里没有。
 
 ### 判读
 
@@ -79,6 +79,5 @@ cat /sys/kernel/debug/airoha-xpon-pon0/mac
 
 ## 三、待办
 
-- 推送 `04f2b21` 与本文档。
 - 重新编译上机；下次 MBI 卡死按第二节两条命令取证，再用 250 ms 逐点定段。
 - 待 250 ms 数据落地后再定 GDM RX 环水位/page_pool 补位失败（`airoha_qdma_fill_rx_queue`，PonWrt 922/144 补丁区）是否值得加。

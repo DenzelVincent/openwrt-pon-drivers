@@ -1,25 +1,45 @@
 # airoha-xpon 补丁与优化记录
 
 起始：2026-11-15
-范围：只记录 `DenzelVincent/openwrt-pon-drivers` 的 `main`/`bugfix` 分支携带的补丁与优化。固件侧（931/932/LED 默认值等）见 PonWrt `docs/2026-11-15-bugfix分支补丁与优化记录.md`，用户态见 userspace 仓库同名文档。本文不复述过程与备选方案。
+上游：`pbs05/openwrt-pon-drivers`，对比基准 `upstream/main 47ad313`（2026-11-16，2026-11-24 拉取）。
+范围：本仓库 `main`/`bugfix` 分支相对上游与相对主分支的补丁与优化。固件侧见 PonWrt 台账，用户态见 userspace 同名文档。
 
-维护口径：
+记录规范：
 
-- 状态只写已核实的事实：`已合入`（main）或`仅 bugfix`；`已推送`或`未推送`；`已上机`或`未上机`；`已验收`或`待验收`。
-- 同步判据：`main` 的全部提交必须已在 `bugfix`（`git rev-list --left-right --count main...bugfix` 左侧为 0）。合并冲突若只落在 `PKG_RELEASE`，取 bugfix 侧更高值再 +1。
-- 新增一条优化只追加表格一行，写清提交、状态、验收要点。
+- 主分支紧跟上游仓库，只记录相对上游仓库的优化。
+- `bugfix` 分支来源于主分支，因此记录相对上游的优化和相对主分支的优化；优化一旦合入主分支，状态标「已合入主分支」。
+- 状态只写已核实的事实：`已推送`/`未推送`、`已上机`/`未上机`、`已验收`/`待验收`。合并冲突若只落在 `PKG_RELEASE`，取 bugfix 侧更高值再 +1。
 
-## 一、已合入 main（bugfix 同步）
+## 一、主分支（相对上游）
 
 | 项 | 提交 | 状态 | 验收要点 |
 |---|---|---|---|
-| XG-PON MBI RX 溢出风暴自愈（pbs05#49） | main `3929816`；bugfix `0b0f4b701a` | 已合入、已推送；待长跑 | 连续 32 次 overrun 且距上次复位 ≥60 s 才复位 MAC epoch；PHY RX 保留，ONU 回 O1，O5 重建约 17 s；正常时 overrun 应恒 0 |
-| PLOAMd IRQ 锁反转 + AES 切换超时传播（pbs05#1） | main `5898477`；bugfix `8f47704` | 已合入、已推送；待验收 | PLOAMd 事件不丢不挂；AES key switch 失败能上报；bugfix `PKG_RELEASE 74` |
-| MBI RX 卡死现场与分段诊断（纯观测） | main `ea612e5`；bugfix `92a21dc` | 已合入、已推送；11-24 已上机 | 不改阈值与复位路径；采集与判读见第三节；bugfix `PKG_RELEASE 75` |
-| MBI 250ms 预故障环形观测（纯观测） | main `04f2b21`；bugfix `6a47ebf` | 已合入；未推送；未上机 | 采样 5 s→250 ms，保留 16 点≈4 s；首个 overrun 冻结 `mbi_fault_trace` 并在 dmesg 打增量+逐点；`bwm_check`/`rx_error` 记首次非零时间；mac dump 增实时 XGEM/XGTC/PLOAMD；bugfix `PKG_RELEASE 76` |
-| EN7572 TX-ready 8 次采样 + EPON LLID 重开 worker | bugfix `d574aed`（后续合并保留） | 仅 bugfix（main 无）、已推送；待验收 | TX-ready 需约 140 ms 稳态才确认，防冷启动假就绪（XG-PON 同样走这段）；LLID 卡死时关/开线路，第三次后额外重载光模块固件；线路重开仅 EPON 触发 |
+| XG-PON MBI RX 溢出风暴自愈（移植上游 #49） | `3929816` | 已推送；已上机长跑中 | 连续 32 次 overrun 且距上次复位 ≥60 s 才复位 MAC epoch；PHY RX 保留，ONU 回 O1，O5 重建约 17 s；正常时 overrun 应恒 0 |
+| PLOAMd IRQ 锁反转 + AES 切换超时传播（移植上游 #1） | `5898477` | 已推送；已上机 | PLOAMd 事件不丢不挂；AES key switch 失败能上报 |
+| MBI RX 卡死现场与分段诊断（纯观测） | `ea612e5` | 已推送；11-24 已上机 | 不改阈值与复位路径；首故障快照与 idle 采样见第三节 |
+| MBI 250ms 预故障环形观测（纯观测） | `04f2b21` | 未推送；未上机 | 采样 5 s→250 ms，保留 16 点≈4 s；首个 overrun 冻结 `mbi_fault_trace` 并在 dmesg 打增量+逐点；`bwm_check`/`rx_error` 记首次非零时间；mac dump 增实时 XGEM/XGTC/PLOAMD |
+| 忽略 IDE 与 tmp、忽略文件补末尾换行 | `1971bd6`、`bd82f7a` | 已推送 | 仅仓库整理，不进固件 |
 
-## 二、MBI RX 卡死观测（`ea612e5` + `04f2b21` / bugfix `92a21dc` + `6a47ebf`）
+## 二、bugfix 分支
+
+### 2.1 相对上游（已合入主分支）
+
+| 项 | 主分支提交 | bugfix 取得方式 | 状态 |
+|---|---|---|---|
+| MBI RX 溢出风暴自愈 | `3929816` | 先在 bugfix 落地 `8c4480e`，再经 `0b0f4b7` 合入主分支版本 | 已合入主分支 |
+| PLOAMd IRQ 锁反转 + AES 超时传播 | `5898477` | `8f47704` 合并主分支 | 已合入主分支 |
+| MBI RX 卡死现场与分段诊断 | `ea612e5` | `92a21dc` 合并主分支；`PKG_RELEASE 75` | 已合入主分支 |
+| MBI 250ms 预故障环形观测 | `04f2b21` | `6a47ebf` 合并主分支；`PKG_RELEASE 76` | 已合入主分支 |
+
+### 2.2 仅 bugfix（相对主分支）
+
+| 项 | 提交 | 状态 | 说明 |
+|---|---|---|---|
+| EN7572 TX-ready 8 次采样 + EPON LLID 重开 worker | `d574aed` | 仅 bugfix（main 无）、已推送；待验收 | TX-ready 需约 140 ms 稳态才确认，防冷启动假就绪（XG-PON 同样走这段）；LLID 卡死时关/开线路，第三次后额外重载光模块固件；线路重开仅 EPON 触发 |
+
+主分支与 bugfix 的其余差异：`PKG_RELEASE`（bugfix 更高）、本文档，以及 bugfix 不含上游的 `tests/pon-recovery`（随 EPON 分支改动移除，未编入固件，不属优化）。功能内容一致。
+
+## 三、MBI RX 卡死观测（两分支共有，主分支 `ea612e5` + `04f2b21`）
 
 ### 补丁行为
 
@@ -77,7 +97,7 @@ cat /sys/kernel/debug/airoha-xpon-pon0/mac
 
 先后顺序以 `MBI pre-fault trace` 的 250 ms 逐点为准：`xgem` 与 `xgtc` 同停 ⇒ MAC 输入端/上游；仅 `delivered` 停、`dropped` 起涨 ⇒ GDM/QDMA 背压；`xgtc`/`ploamd` 仍涨而 `xgem` 停 ⇒ MBI 内部。`bwm`/`rx_error` 长期锁存，只能看 `*_first_ms` 是否远早于事故。
 
-## 三、待办
+## 四、待办
 
 - 推送：`main`（`04f2b21`）、`bugfix`（`6a47ebf`）与本文档提交。
 - 按分支重新编译上机；下次 MBI 卡死按上面两条命令取证，再用 250 ms 逐点定段。

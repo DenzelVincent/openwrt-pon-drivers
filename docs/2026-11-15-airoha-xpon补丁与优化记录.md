@@ -7,17 +7,18 @@
 记录规范：
 
 - 本分支只记录相对上游的优化；chore/文档整理合并成一行。
-- 状态只记录实机验证结果（`已验收`/`待验收`，括号内可注场景或上机情况）；其余记 `—`。
+- 表列：优化项、优化方案简介、关联提交、验收状态、验收说明。
+- 验收状态列只记录实机验证结果（`已验收`/`待验收`，括号内可注场景或上机情况）；其余记 `—`。
 
 ## 一、相对上游
 
-| 项 | 提交 | 状态 | 验收要点 |
-|---|---|---|---|
-| XG-PON MBI RX 溢出风暴自愈（移植上游 #49） | `3929816` | 待验收（已上机观察中） | 连续 32 次 overrun 且距上次复位 ≥60 s 才复位 MAC epoch；PHY RX 保留，ONU 回 O1，O5 重建约 17 s；正常时 overrun 应恒 0 |
-| PLOAMd IRQ 锁反转 + AES 切换超时传播（移植上游 #1） | `5898477` | 待验收（已上机） | PLOAMd 事件不丢不挂；AES key switch 失败能上报 |
-| MBI RX 卡死现场与分段诊断（纯观测） | `ea612e5` | 待验收（11-24 已上机） | 不改阈值与复位路径；首故障快照与 idle 采样见第二节 |
-| MBI 250ms 预故障环形观测（纯观测） | `04f2b21` | 待验收（未上机） | 采样 5 s→250 ms，保留 16 点≈4 s；首个 overrun 冻结 `mbi_fault_trace` 并在 dmesg 打增量+逐点；`bwm_check`/`rx_error` 记首次非零时间；mac dump 增实时 XGEM/XGTC/PLOAMD |
-| 忽略 IDE 与 tmp、忽略文件补末尾换行 | `1971bd6`、`bd82f7a` | — | 仅仓库整理，不进固件 |
+| 优化项 | 优化方案简介 | 关联提交 | 验收状态 | 验收说明 |
+|---|---|---|---|---|
+| XG-PON MBI RX 溢出风暴自愈 | 移植上游 #49：IRQ 累计 RX MBI overrun，连续 32 次且距上次复位 ≥60 s 才复位 MAC epoch（保留 PHY RX，ONU 回 O1，O5 约 17 s 重建） | `3929816` | 待验收（已上机观察中） | 正常时 overrun 应恒 0；下次卡死看自愈触发与 O5 重建耗时 |
+| PLOAMd IRQ 锁反转 + AES 切换超时传播 | 移植上游 #1：修 PLOAMd IRQ 锁反转，AES key switch 超时向上传播 | `5898477` | 待验收（已上机） | PLOAMd 事件不丢不挂；AES key switch 失败能上报 |
+| MBI RX 卡死现场与分段诊断 | 纯观测：首 overrun 时快照 PHY sync/PLOAMd FIFO/XGEM RX/MBI stop 并打环形增量；O5 稳态 idle 采样；latched 值跨 epoch 保留 | `ea612e5` | 待验收（11-24 已上机） | 不改阈值与复位路径；采集与判读见第二节 |
+| MBI 250ms 预故障环形观测 | 纯观测：采样 5 s→250 ms、保留 16 点≈4 s；首 overrun 冻结 `mbi_fault_trace` 并打增量+逐点；`bwm_check`/`rx_error` 记本 epoch 首现时间；`mac` dump 增实时 XGEM/XGTC/PLOAMD | `04f2b21` | 待验收（未上机） | 下次 MBI 卡死按 `MBI pre-fault trace` 逐点判先后；读 `mac` 对比实时计数 |
+| 忽略 IDE 与 tmp、忽略文件补末尾换行 | 忽略 IDE 与 tmp 目录，忽略文件补末尾换行 | `1971bd6`、`bd82f7a` | — | 仅仓库整理，不进固件 |
 
 ## 二、MBI RX 卡死观测（`ea612e5` + `04f2b21`）
 
